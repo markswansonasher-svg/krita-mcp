@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Service
+ServiceTypes=Krita/PythonPlugin
+X-KDE-Library=krita_mcp
+X-Python-2-Compatible=false
+Name=Krita MCP (Claude)
+Comment=Lets Claude draw in Krita through a local socket (127.0.0.1:9877).
