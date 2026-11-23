@@ -23,12 +23,19 @@ import traceback
 
 from krita import Extension, InfoObject, Krita, ManagedColor
 from PyQt5.QtCore import QBuffer, QByteArray, QIODevice, QPointF, QRectF, Qt
-from PyQt5.QtGui import QColor, QImage, QPainterPath
+from PyQt5.QtGui import QColor, QImage, QPainter, QPainterPath
 from PyQt5.QtNetwork import QHostAddress, QTcpServer
-from PyQt5.QtWidgets import QApplication, QMessageBox
+from PyQt5.QtWidgets import QAbstractItemView, QApplication, QMessageBox
+
+from . import raster
 
 PORT = int(os.environ.get("KRITA_MCP_PORT", "9877"))
-VERSION = "0.1.0"
+VERSION = "0.2.0"
+
+# Commands that only read; everything else is tracked so `undo` can take back a whole call.
+READ_ONLY = {"ping", "status", "list_documents", "look", "list_layers", "list_brushes", "get_brush",
+             "get_pixels", "list_filters", "filter_settings", "list_actions", "save", "export_image",
+             "undo", "redo", "switch_document"}
 
 
 class McpError(Exception):
@@ -39,6 +46,10 @@ class McpError(Exception):
 
 def app():
     return Krita.instance()
+
+
+def user_docs():
+    return [d for d in app().documents() if d.name() != "_mcp_scratch"]
 
 
 def color(value):
@@ -71,13 +82,13 @@ def doc_required(params=None):
     params = params or {}
     name = params.get("document")
     if name:
-        for d in app().documents():
+        for d in user_docs():
             if d.name() == name or os.path.basename(d.fileName() or "") == name or d.fileName() == name:
                 return d
-        raise McpError(f"No open document called {name!r}. Open ones: {[d.name() for d in app().documents()]}")
+        raise McpError(f"No open document called {name!r}. Open ones: {[d.name() for d in user_docs()]}")
     d = app().activeDocument()
     if d is None:
-        docs = app().documents()
+        docs = user_docs()
         if docs:
             return docs[-1]
         raise McpError("No document is open. Use new_document or open_document first.")
@@ -85,10 +96,11 @@ def doc_required(params=None):
 
 
 def same_doc(a, b):
+    # libkis hands out a new wrapper object per call, so compare the documents' root node ids
     try:
-        return a == b
-    except Exception:
         return a.rootNode().uniqueId() == b.rootNode().uniqueId()
+    except Exception:
+        return False
 
 
 def view_for(doc, activate=True):
@@ -151,6 +163,7 @@ def node_info(n, active=None):
         "blend_mode": n.blendingMode(),
         "locked": n.locked(),
         "alpha_locked": n.alphaLocked(),
+        "clipped": n.inheritAlpha(),
     }
     b = n.bounds()
     if b.width() > 0:
@@ -161,6 +174,14 @@ def node_info(n, active=None):
     if kids and n.type() == "grouplayer":
         info["children"] = [node_info(c, active) for c in reversed(kids)]   # top first
     return info
+
+
+def settle(doc):
+    """Let Krita finish an async step (undo of a merge, a stroke...) before the next one."""
+    QApplication.processEvents()
+    if doc is not None:
+        doc.waitForDone()
+    QApplication.processEvents()
 
 
 def finish(doc):
@@ -189,6 +210,105 @@ def qimage_bytes(img):
 def require_rgba8(doc):
     if doc.colorModel() != "RGBA" or doc.colorDepth() != "U8":
         raise McpError(f"This needs an 8-bit RGBA document (this one is {doc.colorModel()}/{doc.colorDepth()}).")
+
+
+def typed(parent, node):
+    """createNode hands back a plain Node; the tree gives the typed one (VectorLayer...)."""
+    uid = node.uniqueId()
+    return next((c for c in parent.childNodes() if c.uniqueId() == uid), node)
+
+
+def add_paint_layer(doc, name, above):
+    """New paint layer directly above `above` (or at the top), made active."""
+    n = doc.createNode(name, "paintlayer")
+    if above is None:
+        parent = doc.rootNode()
+        kids = parent.childNodes()
+        parent.addChildNode(n, kids[-1] if kids else None)
+    else:
+        parent = above.parentNode()
+        parent.addChildNode(n, above)
+    doc.setActiveNode(n)
+    return typed(parent, n)
+
+
+def target_layer(doc, p):
+    """The paint layer an operation draws on: new_layer (created) > layer > active layer."""
+    if p.get("new_layer"):
+        return add_paint_layer(doc, p["new_layer"], doc.activeNode())
+    n = find_node(doc, p.get("layer"))
+    if n.type() != "paintlayer":
+        raise McpError(f"{n.name()!r} is a {n.type()}; this needs a paint layer (or pass new_layer).")
+    return n
+
+
+def commit(doc, node, img, x=0, y=0, mode="normal", opacity=1.0, clip=False, use_selection=True,
+           blur=0.0, name="mcp paint"):
+    """Composite a QImage onto a paint layer the undoable way (temporary layer + merge down).
+
+    mode: any Krita blend mode id (normal, multiply, screen, overlay, add, soft_light, color_dodge,
+    erase...). clip: only where the layer already has paint (also automatic when the layer is
+    alpha-locked). use_selection: limit to the current selection. blur: soften the result (px)."""
+    require_rgba8(doc)
+    img = img.convertToFormat(QImage.Format_ARGB32_Premultiplied)
+    if blur and float(blur) > 0:          # blur first, so selection / clip still cut a clean edge
+        img, pad = raster.blur_image(img, float(blur))
+        x, y = x - pad, y - pad
+    # keep inside the canvas
+    cx, cy = max(0, x), max(0, y)
+    cw, ch = min(doc.width(), x + img.width()) - cx, min(doc.height(), y + img.height()) - cy
+    if cw <= 0 or ch <= 0:
+        return node
+    if (cx, cy, cw, ch) != (x, y, img.width(), img.height()):
+        img = img.copy(cx - x, cy - y, cw, ch)
+        x, y = cx, cy
+    w, h = img.width(), img.height()
+    sel = doc.selection() if use_selection else None
+    if sel is not None and sel.width() > 0:
+        raster.mask_with(img, raster.alpha8_image(sel.pixelData(x, y, w, h), w, h))
+    if clip or node.alphaLocked():
+        raster.mask_with(img, raster.image_from_bytes(node.pixelData(x, y, w, h), w, h))
+    props = (node.name(), node.opacity(), node.blendingMode(), node.visible(), node.alphaLocked(),
+             node.inheritAlpha(), node.locked())
+    parent = node.parentNode()
+    temp = doc.createNode(name, "paintlayer")
+    parent.addChildNode(temp, node)
+    temp = typed(parent, temp)
+    temp.setPixelData(raster.image_bytes(img), x, y, w, h)
+    op = int(round(max(0.0, min(1.0, float(opacity))) * 255))
+    if op != 255:
+        temp.setOpacity(op)
+    if (mode or "normal") != "normal":
+        temp.setBlendingMode(mode)
+    if node.locked():
+        node.setLocked(False)
+    merged = temp.mergeDown()
+    doc.waitForDone()
+    merged = merged or find_node(doc, props[0])
+    name0, op0, bm0, vis0, al0, ia0, lk0 = props
+    if merged.name() != name0:
+        merged.setName(name0)
+    if merged.opacity() != op0:
+        merged.setOpacity(op0)
+    if merged.blendingMode() != bm0:
+        merged.setBlendingMode(bm0)
+    merged.setVisible(vis0)
+    merged.setAlphaLocked(al0)
+    merged.setInheritAlpha(ia0)
+    merged.setLocked(lk0)
+    doc.setActiveNode(merged)
+    finish(doc)
+    return merged
+
+
+def undo_position():
+    """(rows, index) of the active document's undo history, from Krita's Undo History view."""
+    with contextlib.suppress(Exception):
+        w = app().activeWindow().qwindow()
+        for v in w.findChildren(QAbstractItemView):
+            if v.metaObject().className() == "KisUndoView" and v.model() is not None:
+                return v.model().rowCount(), v.currentIndex().row()
+    return None
 
 
 # ----------------------------------------------------------------------------- brush state
@@ -338,7 +458,7 @@ class Commands:
     def status(self, p):
         a = app()
         out = {"krita": a.version(), "bridge": VERSION, "port": PORT,
-               "documents": [d.name() or os.path.basename(d.fileName() or "") for d in a.documents()]}
+               "documents": [d.name() or os.path.basename(d.fileName() or "") for d in user_docs()]}
         d = a.activeDocument()
         if d is not None:
             out["active_document"] = {
@@ -392,7 +512,7 @@ class Commands:
         act = app().activeDocument()
         return [{"name": d.name(), "file": d.fileName(), "width": d.width(), "height": d.height(),
                  "modified": d.modified(), "active": act is not None and same_doc(d, act)}
-                for d in app().documents()]
+                for d in user_docs()]
 
     def switch_document(self, p):
         d = doc_required({"document": p["document"]})
@@ -442,7 +562,7 @@ class Commands:
         if ext in (".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff") and d.colorDepth() == "U8":
             if layer:
                 n = find_node(d, layer)
-                img = n.thumbnail(d.width(), d.height())
+                img = raster.image_from_bytes(n.projectionPixelData(0, 0, d.width(), d.height()), d.width(), d.height())
             else:
                 img = d.projection(0, 0, d.width(), d.height())
             if p.get("crop_to_content"):
@@ -463,7 +583,6 @@ class Commands:
             if ext in (".jpg", ".jpeg", ".bmp"):
                 flat = QImage(img.size(), QImage.Format_RGB32)
                 flat.fill(color(p.get("matte", "#ffffff")))
-                from PyQt5.QtGui import QPainter
                 painter = QPainter(flat)
                 painter.drawImage(0, 0, img)
                 painter.end()
@@ -496,14 +615,13 @@ class Commands:
         max_size = int(p.get("max_size", 1024))
         if p.get("layer"):
             n = find_node(d, p["layer"])
-            img = n.thumbnail(d.width(), d.height())
+            img = raster.image_from_bytes(n.projectionPixelData(0, 0, d.width(), d.height()), d.width(), d.height())
         else:
             img = d.projection(0, 0, d.width(), d.height())
         r = p.get("region")
         if r:
             img = img.copy(int(r[0]), int(r[1]), int(r[2]), int(r[3]))
         if p.get("checker", True) and img.hasAlphaChannel():
-            from PyQt5.QtGui import QPainter
             bg = QImage(img.size(), QImage.Format_RGB32)
             bg.fill(QColor("#ffffff"))
             painter = QPainter(bg)
@@ -515,6 +633,26 @@ class Commands:
             painter.drawImage(0, 0, img)
             painter.end()
             img = bg
+        if p.get("grayscale"):
+            img = img.convertToFormat(QImage.Format_Grayscale8).convertToFormat(QImage.Format_RGB32)
+        if p.get("grid"):
+            img = img.convertToFormat(QImage.Format_RGB32)
+            step = int(p["grid"])
+            ox, oy = (int(r[0]), int(r[1])) if r else (0, 0)
+            k = max(1.0, max(img.width(), img.height()) / max_size)    # keep lines/labels readable after scaling
+            painter = QPainter(img)
+            from PyQt5.QtGui import QFont, QPen
+            painter.setPen(QPen(QColor(255, 0, 140, 150), k))
+            f = QFont("Arial")
+            f.setPixelSize(int(11 * k))
+            painter.setFont(f)
+            for gx in range((ox // step + 1) * step, ox + img.width(), step):
+                painter.drawLine(int(gx - ox), 0, int(gx - ox), img.height())
+                painter.drawText(int(gx - ox + 2 * k), int(12 * k), str(gx))
+            for gy in range((oy // step + 1) * step, oy + img.height(), step):
+                painter.drawLine(0, int(gy - oy), img.width(), int(gy - oy))
+                painter.drawText(int(2 * k), int(gy - oy - 2 * k), str(gy))
+            painter.end()
         out = png_b64(img, max_size)
         out["document_size"] = [d.width(), d.height()]
         return out
@@ -549,6 +687,11 @@ class Commands:
             kids = parent.childNodes()
             return parent, (kids[-1] if kids else None)
         act = d.activeNode()
+        # a mask is active -> place next to the layer that owns it
+        while act is not None and act.parentNode() is not None and act.parentNode().type() not in ("grouplayer", ""):
+            if act.parentNode().parentNode() is None:
+                break
+            act = act.parentNode()
         if act is None or act.parentNode() is None:
             kids = d.rootNode().childNodes()
             return d.rootNode(), (kids[-1] if kids else None)
@@ -565,6 +708,8 @@ class Commands:
             n.setLocked(bool(p["locked"]))
         if p.get("alpha_locked") is not None:
             n.setAlphaLocked(bool(p["alpha_locked"]))
+        if p.get("clipped") is not None:
+            n.setInheritAlpha(bool(p["clipped"]))
         if p.get("new_name"):
             n.setName(p["new_name"])
 
@@ -625,25 +770,63 @@ class Commands:
 
     def clear_layer(self, p):
         d = doc_required(p)
-        require_rgba8(d)
-        n = find_node(d, p.get("layer"))
+        n = target_layer(d, p)
         b = n.bounds()
         if b.width() > 0:
-            n.setPixelData(bytes(b.width() * b.height() * 4), b.x(), b.y(), b.width(), b.height())
-        finish(d)
+            img = raster.new_image(b.width(), b.height())
+            img.fill(QColor(0, 0, 0))
+            commit(d, n, img, b.x(), b.y(), mode="erase", use_selection=p.get("use_selection", True))
         return {"cleared": n.name()}
 
     def fill_layer(self, p):
+        """Flat color (or gradient dict) over a rect / the selection / the whole layer."""
         d = doc_required(p)
-        require_rgba8(d)
-        n = find_node(d, p.get("layer"))
+        n = target_layer(d, p)
         x, y, w, h = [int(v) for v in (p.get("rect") or [0, 0, d.width(), d.height()])]
-        img = QImage(w, h, QImage.Format_ARGB32)
-        img.fill(color(p.get("color", "#ffffff")))
-        img, data = qimage_bytes(img)
-        n.setPixelData(data, x, y, w, h)
-        finish(d)
+        img = raster.new_image(w, h)
+        painter = QPainter(img)
+        painter.translate(-x, -y)
+        painter.fillRect(QRectF(x, y, w, h), raster.brush_for(p.get("color", "#ffffff")))
+        painter.end()
+        n = commit(d, n, img, x, y, mode=p.get("mode", "normal"), opacity=p.get("opacity", 1.0),
+                   clip=p.get("clip", False), blur=p.get("blur", 0))
         return {"filled": n.name(), "rect": [x, y, w, h]}
+
+    # --- raster painting (undoable, gradients, soft edges, clipping) -------------
+    def paint(self, p):
+        """Antialiased shapes filled with colors or gradients, composited with a blend mode."""
+        d = doc_required(p)
+        n = target_layer(d, p)
+        img, x, y = raster.render_fills(p.get("shapes", []), d.width(), d.height())
+        n = commit(d, n, img, x, y, mode=p.get("mode", "normal"), opacity=p.get("opacity", 1.0),
+                   clip=p.get("clip", False), blur=p.get("blur", 0))
+        return {"layer": n.name(), "shapes": len(p.get("shapes", []))}
+
+    def paint_svg(self, p):
+        """Render SVG (with gradients) straight onto a paint layer, in document pixels."""
+        d = doc_required(p)
+        n = target_layer(d, p)
+        img, x, y = raster.render_svg(p["svg"], d.width(), d.height())
+        n = commit(d, n, img, x, y, mode=p.get("mode", "normal"), opacity=p.get("opacity", 1.0),
+                   clip=p.get("clip", False), blur=p.get("blur", 0))
+        return {"layer": n.name()}
+
+    def add_mask(self, p):
+        """Transparency mask on a layer from the current selection (or shapes)."""
+        d = doc_required(p)
+        n = find_node(d, p.get("layer"))
+        if p.get("shapes"):
+            self.select({"mode": "shapes", "shapes": p["shapes"], "feather": p.get("feather")})
+        sel = d.selection()
+        if sel is None:
+            raise McpError("Make a selection first (select), or pass shapes.")
+        m = d.createTransparencyMask(p.get("name") or "Mask")
+        m.setSelection(sel)
+        n.addChildNode(m, None)
+        if p.get("deselect", True):
+            d.setSelection(None)
+        finish(d)
+        return {"layer": n.name(), "mask": m.name()}
 
     def place_image(self, p):
         """Put an image file onto a new paint layer (references, textures, photos)."""
@@ -731,100 +914,191 @@ class Commands:
         return brush_state(view_for(doc_required(p)))
 
     # --- painting --------------------------------------------------------------
+    # Brush engine work happens in a hidden scratch document, then lands on the real layer in
+    # one undoable merge. That keeps Krita's undo history short, lets a whole stroke have one
+    # opacity (no darker overlaps between its segments), and allows blend modes / clip / blur.
+    _scratch = None
+
+    def _scratch_layer(self, d):
+        s = Commands._scratch
+        if s is None or s.width() != d.width() or s.height() != d.height():
+            if s is not None:
+                with contextlib.suppress(Exception):
+                    s.close()
+            s = app().createDocument(d.width(), d.height(), "_mcp_scratch", "RGBA", "U8", "", d.resolution())
+            Commands._scratch = s
+        for c in s.rootNode().childNodes():
+            c.remove()
+        n = s.createNode("scratch", "paintlayer")
+        s.rootNode().addChildNode(n, None)
+        return s, typed(s.rootNode(), n)
+
+    def _grab(self, s, sn, d, box):
+        s.waitForDone()
+        x0, y0, x1, y1 = box
+        x0, y0 = max(0, int(math.floor(x0))), max(0, int(math.floor(y0)))
+        x1, y1 = min(d.width(), int(math.ceil(x1))), min(d.height(), int(math.ceil(y1)))
+        if x1 <= x0 or y1 <= y0:
+            return None
+        return raster.image_from_bytes(sn.pixelData(x0, y0, x1 - x0, y1 - y0), x1 - x0, y1 - y0), x0, y0
+
+    _INK_STYLES = {
+        "ink": {},
+        "pencil": {"grain": 0.55, "opacity": 0.9, "min_width": 0.6},
+        "charcoal": {"grain": 0.8, "grain_scale": 2, "opacity": 0.85},
+        "marker": {"opacity": 0.7},
+    }
+
     def draw_strokes(self, p):
-        """Real brush strokes with the current (or given) brush. Each stroke:
-        {points: [[x,y] or [x,y,pressure]...], color, size, preset, opacity, flow,
-         blend_mode, eraser, smooth (default true), closed}"""
+        """Strokes on a paint layer. engine (per call or per stroke):
+          "brush"  - Krita's brush engine with the current/given preset (textured, painterly)
+          "ink" / "pencil" / "charcoal" / "marker" - vector-precise variable-width strokes with
+                     clean tapers and optional paper grain; color may be a gradient dict.
+        Each stroke: {points: [[x,y] or [x,y,pressure]...], color, size, preset, opacity, flow,
+         eraser, smooth (default true), closed, taper (0-0.5, ink engines), grain, min_width}"""
         d = doc_required(p)
-        n = find_node(d, p.get("layer"))
-        if n.type() != "paintlayer":
-            raise McpError(f"{n.name()!r} is a {n.type()}; brush strokes need a paint layer.")
+        n = target_layer(d, p)
         v = view_for(d)
-        apply_brush(v, p)
-        count = 0
+        apply_brush(v, {k: p[k] for k in ("preset", "color", "size", "flow", "blend_mode") if p.get(k) is not None})
+        base = brush_state(v)
+        default_opacity = float(p["opacity"]) if p.get("opacity") is not None else float(base.get("opacity", 1.0))
+        default_eraser = bool(p.get("eraser", False))
+        engine0 = p.get("engine", "brush")
+        mode = p.get("mode", "normal")
+
+        # split into consecutive runs that can share one commit
+        runs = []
         for s in p.get("strokes", []):
-            apply_brush(v, s)
-            ps = pts(s["points"])
-            smooth = s.get("smooth", p.get("smooth", True))
-            if s.get("closed"):
-                ps = ps + [ps[0]]
-            pressures = {round(q[2], 3) for q in ps}
-            if len(pressures) > 1:
-                # varying pressure: lots of short segments, each with its own pressures
-                dense = resample(catmull_points(ps) if smooth else ps, step=max(1.0, float(s.get("size") or 4) / 6))
-                for a, b in zip(dense, dense[1:]):
-                    paint_line(n, a, b)
+            eng = s.get("engine", engine0)
+            if eng in self._INK_STYLES:
+                key = ("ink", bool(s.get("eraser", default_eraser)))
             else:
-                pr = ps[0][2]
-                if pr != 1.0 and len(ps) >= 2:
-                    dense = resample(catmull_points(ps) if smooth else ps, step=4.0)
+                key = ("brush", float(s.get("opacity", default_opacity)), bool(s.get("eraser", default_eraser)))
+            if runs and runs[-1][0] == key:
+                runs[-1][1].append(s)
+            else:
+                runs.append((key, [s]))
+
+        count = 0
+        for key, strokes in runs:
+            if key[0] == "ink":
+                erase = key[1]
+                prepared = []
+                for s in strokes:
+                    st = dict(self._INK_STYLES[s.get("engine", engine0)])
+                    st.setdefault("color", p.get("color") or base.get("color", "#000000"))
+                    st.setdefault("size", p.get("size") or base.get("size", 8))
+                    if p.get("opacity") is not None:
+                        st["opacity"] = p["opacity"]
+                    for k in ("taper", "grain", "grain_scale", "min_width", "smooth"):
+                        if p.get(k) is not None:
+                            st[k] = p[k]
+                    st.update({k: val for k, val in s.items() if val is not None and k != "engine"})
+                    pts_ = [list(q) if not isinstance(q, dict) else [q["x"], q["y"], q.get("pressure", 1.0)]
+                            for q in st["points"]]
+                    if st.get("closed"):
+                        pts_ = pts_ + [pts_[0]]
+                    st["points"] = pts_
+                    prepared.append(st)
+                rendered = raster.render_ink_strokes(prepared, d.width(), d.height(), {})
+                if rendered:
+                    img, x, y = rendered
+                    n = commit(d, n, img, x, y, mode="erase" if erase else mode, opacity=1.0,
+                               clip=p.get("clip", False), blur=p.get("blur", 0))
+                count += len(strokes)
+                continue
+
+            _, opacity, erase = key
+            s_doc, sn = self._scratch_layer(d)
+            box = [float("inf"), float("inf"), float("-inf"), float("-inf")]
+            for s in strokes:
+                apply_brush(v, {k: s[k] for k in ("preset", "color", "size", "flow", "blend_mode") if s.get(k) is not None})
+                v.setPaintingOpacity(1.0)
+                v.setEraserMode(False)
+                ps = pts(s["points"])
+                if s.get("closed"):
+                    ps = ps + [ps[0]]
+                smooth = s.get("smooth", p.get("smooth", True))
+                size = float(v.brushSize())
+                m = size * 1.5 + 4
+                for q in ps:
+                    box = [min(box[0], q[0] - m), min(box[1], q[1] - m), max(box[2], q[0] + m), max(box[3], q[1] + m)]
+                if len({round(q[2], 3) for q in ps}) > 1 or (ps[0][2] != 1.0 and len(ps) >= 2):
+                    dense = resample(catmull_points(ps) if smooth else ps, step=max(1.0, size / 6))
                     for a, b in zip(dense, dense[1:]):
-                        paint_line(n, a, b)
+                        paint_line(sn, a, b)
                 else:
-                    n.paintPath(smooth_path(ps, closed=False, smooth=smooth), "ForegroundColor", "None")
-            count += 1
-            d.waitForDone()
-        finish(d)
+                    sn.paintPath(smooth_path(ps, closed=False, smooth=smooth), "ForegroundColor", "None")
+                count += 1
+            grabbed = self._grab(s_doc, sn, d, box)
+            if grabbed:
+                img, x, y = grabbed
+                n = commit(d, n, img, x, y, mode="erase" if erase else mode, opacity=opacity,
+                           clip=p.get("clip", False), blur=p.get("blur", 0))
+            v.setPaintingOpacity(opacity)
         return {"strokes": count, "layer": n.name(), "brush": brush_state(v)}
 
     def draw_shapes(self, p):
-        """Brush-outlined and/or filled shapes. Each shape:
+        """Brush-outlined and/or filled shapes (Krita brush engine). Each shape:
         {type: rect|ellipse|circle|polygon|line|path, x,y,w,h | cx,cy,r | points,
-         stroke: color|null, fill: color|null, size, preset, opacity, smooth, closed}"""
+         stroke: color|null, fill: color|null, size, preset, smooth, closed}"""
         d = doc_required(p)
-        n = find_node(d, p.get("layer"))
-        if n.type() != "paintlayer":
-            raise McpError(f"{n.name()!r} is a {n.type()}; painting needs a paint layer.")
+        n = target_layer(d, p)
         v = view_for(d)
-        apply_brush(v, p)
-        old_bg = v.backgroundColor()
-        old_fg = v.foregroundColor()
+        apply_brush(v, {k: p[k] for k in ("preset", "size", "flow") if p.get(k) is not None})
+        old_bg, old_fg = v.backgroundColor(), v.foregroundColor()
+        old_op = v.paintingOpacity()
+        s_doc, sn = self._scratch_layer(d)
         try:
+            v.setPaintingOpacity(1.0)
             for s in p.get("shapes", []):
-                brush = {k: s[k] for k in ("preset", "size", "opacity", "flow", "blend_mode", "eraser") if k in s}
-                apply_brush(v, brush)
+                apply_brush(v, {k: s[k] for k in ("preset", "size", "flow") if k in s})
                 stroke = s.get("stroke", "current")
                 fill = s.get("fill")
-                if stroke not in (None, "none", "current"):
-                    v.setForeGroundColor(managed(color(stroke), v))
+                v.setForeGroundColor(old_fg if stroke in (None, "none", "current") else managed(color(stroke), v))
                 if fill not in (None, "none"):
                     v.setBackGroundColor(managed(color(fill), v))
                 ss = "None" if stroke in (None, "none") else "ForegroundColor"
                 fs = "None" if fill in (None, "none") else "BackgroundColor"
                 t = s.get("type", "rect")
                 if t in ("rect", "rectangle"):
-                    n.paintRectangle(QRectF(s["x"], s["y"], s["w"], s["h"]), ss, fs)
+                    sn.paintRectangle(QRectF(s["x"], s["y"], s["w"], s["h"]), ss, fs)
                 elif t in ("ellipse", "circle"):
                     if "r" in s:
                         r = float(s["r"])
                         rect = QRectF(s["cx"] - r, s["cy"] - r, 2 * r, 2 * r)
                     else:
                         rect = QRectF(s["x"], s["y"], s["w"], s["h"])
-                    n.paintEllipse(rect, ss, fs)
+                    sn.paintEllipse(rect, ss, fs)
                 elif t == "polygon":
-                    n.paintPolygon([QPointF(q[0], q[1]) for q in pts(s["points"])], ss, fs)
+                    sn.paintPolygon([QPointF(q[0], q[1]) for q in pts(s["points"])], ss, fs)
                 elif t == "line":
                     q = pts(s["points"])
-                    paint_line(n, q[0], q[1])
+                    paint_line(sn, q[0], q[1])
                 elif t == "path":
-                    n.paintPath(smooth_path(pts(s["points"]), closed=s.get("closed", False),
-                                            smooth=s.get("smooth", True)), ss, fs)
+                    sn.paintPath(smooth_path(pts(s["points"]), closed=s.get("closed", False),
+                                             smooth=s.get("smooth", True)), ss, fs)
                 else:
                     raise McpError(f"Unknown shape type {t!r}.")
-                d.waitForDone()
+                s_doc.waitForDone()
         finally:
             v.setBackGroundColor(old_bg)
-            if p.get("keep_stroke_color") is False:
-                v.setForeGroundColor(old_fg)
-        finish(d)
+            v.setForeGroundColor(old_fg)
+            v.setPaintingOpacity(old_op)
+        grabbed = self._grab(s_doc, sn, d, (0, 0, d.width(), d.height()))
+        if grabbed:
+            img, x, y = grabbed
+            n = commit(d, n, img, x, y, mode=p.get("mode", "normal"), opacity=float(p.get("opacity", 1.0)),
+                       clip=p.get("clip", False), blur=p.get("blur", 0))
         return {"shapes": len(p.get("shapes", [])), "layer": n.name()}
 
     def set_pixels(self, p):
-        """Exact pixels (pixel art): {pixels: [[x,y,color], ...]} or {rows: ["..",".."], palette: {"a": "#f00"}, x, y, scale}"""
+        """Exact pixels (pixel art): {rows: ["..",".."], palette: {"a": "#f00"}, x, y, scale} or
+        {pixels: [[x,y,color], ...]}. replace=true also clears the cells left transparent."""
         d = doc_required(p)
-        require_rgba8(d)
-        n = find_node(d, p.get("layer"))
+        n = target_layer(d, p)
         scale = max(1, int(p.get("scale", 1)))
+        x0, y0 = int(p.get("x", 0)), int(p.get("y", 0))
         if p.get("rows"):
             rows = p["rows"]
             pal = {k: color(v) for k, v in (p.get("palette") or {}).items()}
@@ -835,31 +1109,24 @@ class Commands:
                 for xx, ch in enumerate(row):
                     if ch in pal:
                         img.setPixelColor(xx, yy, pal[ch])
-            if scale > 1:
-                img = img.scaled(w * scale, h * scale, Qt.IgnoreAspectRatio, Qt.FastTransformation)
-            x0, y0 = int(p.get("x", 0)), int(p.get("y", 0))
-            if p.get("replace", False):
-                img, data = qimage_bytes(img)
-                n.setPixelData(data, x0, y0, img.width(), img.height())
-            else:  # composite over what is there (transparent cells keep the old pixels)
-                raw = bytes(n.pixelData(x0, y0, img.width(), img.height()))
-                old = QImage(raw, img.width(), img.height(), img.width() * 4, QImage.Format_ARGB32).copy()
-                from PyQt5.QtGui import QPainter
-                painter = QPainter(old)
-                painter.drawImage(0, 0, img)
-                painter.end()
-                old, data = qimage_bytes(old)
-                n.setPixelData(data, x0, y0, old.width(), old.height())
-            finish(d)
-            return {"layer": n.name(), "rect": [x0, y0, img.width(), img.height()]}
-        count = 0
-        for x, y, c in p.get("pixels", []):
-            qc = color(c)
-            px = bytes([qc.blue(), qc.green(), qc.red(), qc.alpha()]) * (scale * scale)
-            n.setPixelData(px, int(x) * scale, int(y) * scale, scale, scale)
-            count += 1
-        finish(d)
-        return {"layer": n.name(), "pixels": count}
+        else:
+            pix = p.get("pixels", [])
+            if not pix:
+                raise McpError("Give rows + palette, or pixels.")
+            w = max(int(q[0]) for q in pix) + 1
+            h = max(int(q[1]) for q in pix) + 1
+            img = QImage(w, h, QImage.Format_ARGB32)
+            img.fill(Qt.transparent)
+            for x, y, c in pix:
+                img.setPixelColor(int(x), int(y), color(c))
+        if scale > 1:
+            img = img.scaled(img.width() * scale, img.height() * scale, Qt.IgnoreAspectRatio, Qt.FastTransformation)
+        if p.get("replace"):
+            clear = raster.new_image(img.width(), img.height())
+            clear.fill(QColor(0, 0, 0))
+            n = commit(d, n, clear, x0, y0, mode="erase", use_selection=False)
+        n = commit(d, n, img, x0, y0, use_selection=False)
+        return {"layer": n.name(), "rect": [x0, y0, img.width(), img.height()]}
 
     def get_pixels(self, p):
         d = doc_required(p)
@@ -885,22 +1152,55 @@ class Commands:
 
     # --- selection, filters, actions ----------------------------------------
     def select(self, p):
-        """Rectangular selection ({rect:[x,y,w,h]}), 'all', or 'none'."""
+        """Selections. mode:
+          rect (rect=[x,y,w,h]) | ellipse/circle/polygon/path (one shape's fields) | shapes (list of
+          shape dicts, may include {"type":"svg","svg":...}) | svg (svg=...) | layer (opaque pixels of a
+          layer) | all | none | invert | modify (just feather/grow/shrink the current selection)
+        op: replace (default) | add | subtract | intersect.  feather / grow / shrink in px."""
+        from krita import Selection
         d = doc_required(p)
         mode = p.get("mode", "rect")
+        W, H = d.width(), d.height()
+        cur = d.selection()
         if mode == "none":
             d.setSelection(None)
-            app().action("deselect").trigger()
             return {"selection": None}
-        from krita import Selection
-        s = Selection()
-        if mode == "all":
-            s.select(0, 0, d.width(), d.height(), 255)
+        if mode in ("invert", "modify"):
+            if cur is None:
+                raise McpError("There is no selection.")
+            new = cur
+            if mode == "invert":
+                new.invert()
         else:
-            x, y, w, h = [int(v) for v in p["rect"]]
-            s.select(x, y, w, h, 255)
-        d.setSelection(s)
-        return {"selection": [s.x(), s.y(), s.width(), s.height()]}
+            new = Selection()
+            if mode == "all":
+                new.select(0, 0, W, H, 255)
+            elif mode == "rect" and p.get("rect"):
+                x, y, w, h = [int(v) for v in p["rect"]]
+                new.select(x, y, w, h, 255)
+            elif mode == "layer":
+                n = find_node(d, p.get("layer"))
+                new.setPixelData(bytes(n.pixelData(0, 0, W, H))[3::4], 0, 0, W, H)
+            else:
+                if mode == "shapes":
+                    shapes = p.get("shapes") or []
+                elif mode == "svg":
+                    shapes = [{"type": "svg", "svg": p["svg"]}]
+                else:
+                    shapes = [dict(p, type=mode)]
+                new.setPixelData(raster.alpha8_bytes(raster.shapes_mask(shapes, W, H)), 0, 0, W, H)
+            op = p.get("op", "replace")
+            if op != "replace" and cur is not None:
+                {"add": cur.add, "subtract": cur.subtract, "intersect": cur.intersect}[op](new)
+                new = cur
+        if p.get("grow"):
+            new.grow(int(p["grow"]), int(p["grow"]))
+        if p.get("shrink"):
+            new.shrink(int(p["shrink"]), int(p["shrink"]), False)
+        if p.get("feather"):
+            new.feather(int(p["feather"]))
+        d.setSelection(new)
+        return {"selection": [new.x(), new.y(), new.width(), new.height()]}
 
     def list_filters(self, p):
         return sorted(app().filters())
@@ -952,11 +1252,48 @@ class Commands:
                 out.append(f"{a.objectName()}  ({text})")
         return sorted(out)[: int(p.get("limit", 100))]
 
+    history = []        # [(document key, undo steps)] for tool calls, newest last
+    redo_stack = []
+
     def undo(self, p):
-        return self.run_action({"action": "edit_undo", "times": p.get("times", 1)})
+        """Undo whole tool calls (all the Krita steps each one made). raw=true: single Krita steps."""
+        d = app().activeDocument()
+        key = d.rootNode().uniqueId().toString() if d is not None else None
+        undone = []
+        for _ in range(int(p.get("times", 1))):
+            steps = 1
+            if not p.get("raw"):
+                for i in range(len(self.history) - 1, -1, -1):
+                    if self.history[i][0] == key:
+                        steps = self.history.pop(i)[1]
+                        break
+            for _ in range(steps):
+                app().action("edit_undo").trigger()
+                settle(d)
+            Commands.redo_stack.append((key, steps))
+            undone.append(steps)
+        if d is not None:
+            finish(d)
+        return {"undone_calls": len(undone), "krita_steps": sum(undone)}
 
     def redo(self, p):
-        return self.run_action({"action": "edit_redo", "times": p.get("times", 1)})
+        d = app().activeDocument()
+        key = d.rootNode().uniqueId().toString() if d is not None else None
+        done = 0
+        for _ in range(int(p.get("times", 1))):
+            steps = 1
+            for i in range(len(self.redo_stack) - 1, -1, -1):
+                if self.redo_stack[i][0] == key:
+                    steps = self.redo_stack.pop(i)[1]
+                    break
+            for _ in range(steps):
+                app().action("edit_redo").trigger()
+                settle(d)
+            self.history.append((key, steps))
+            done += steps
+        if d is not None:
+            finish(d)
+        return {"krita_steps": done}
 
     # --- escape hatch ------------------------------------------------------
     def execute_python(self, p):
@@ -1039,7 +1376,23 @@ class Bridge:
             fn = getattr(self.cmds, name, None)
             if name.startswith("_") or fn is None:
                 raise McpError(f"Unknown command {name!r}.")
-            return {"id": rid, "ok": True, "result": fn(req.get("params") or {})}
+            if name in READ_ONLY:
+                return {"id": rid, "ok": True, "result": fn(req.get("params") or {})}
+            before_doc = app().activeDocument()
+            before = undo_position()
+            try:
+                result = fn(req.get("params") or {})
+            finally:
+                after_doc = app().activeDocument()
+                after = undo_position()
+                if (before and after and before_doc is not None and after_doc is not None
+                        and same_doc(before_doc, after_doc)):
+                    steps = after[1] - before[1]
+                    if steps > 0:
+                        Commands.history.append((after_doc.rootNode().uniqueId().toString(), steps))
+                        Commands.history[:] = Commands.history[-200:]
+                        Commands.redo_stack.clear()
+            return {"id": rid, "ok": True, "result": result}
         except McpError as e:
             return {"id": rid, "ok": False, "error": str(e)}
         except KeyError as e:

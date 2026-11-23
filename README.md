@@ -1,10 +1,21 @@
 # Krita MCP
 
-Lets Claude (or any [MCP](https://modelcontextprotocol.io) client) **draw in Krita**: real brush strokes with pressure, filled shapes, SVG vector art, pixel art, layers, filters, and exports to PNG/JPG/KRA.
+Lets Claude (or any [MCP](https://modelcontextprotocol.io) client) **paint in Krita**: Krita's brush engine with pressure, clean tapered ink, pencil and charcoal grain, gradient fills, SVG, blend modes, clipping, masks, shaped selections, soft blur, procedural marks (scatter, hatching), pixel art, layers, filters, and export to PNG/JPG/KRA. Every tool call is a single undo step.
 
-![A test scene drawn entirely through the MCP: shapes, an SVG house, pressure-tapered ink strokes and a pixel-art sprite](docs/smoke-test.png)
+![A sci-fi soldier in a spaceship hallway, seen from a low angle](docs/scifi-soldier.png)
 
-*Everything above was drawn through the MCP by [`tools/smoke_test.py`](tools/smoke_test.py).*
+*Painted entirely through the MCP's tools by [`examples/scifi_soldier.py`](examples/scifi_soldier.py): a projected low-angle hallway, the soldier built from depth-ordered parts, separate clipped shading, key and rim light layers, emissive glow with bloom, light beams, haze, dust, vignette, color grade and grain. All of it stays as editable layers in the saved `.kra`.*
+
+## Where this stands next to image generators
+
+Diffusion models (the image generators in ChatGPT, Gemini and others) are still far ahead at photorealism, painterly texture and natural anatomy. This MCP is good at different things:
+
+- **Exact control:** composition, perspective and proportions come from numbers, so a revision changes only what you asked for.
+- **Editable output:** a layered `.kra` file with separate light, shade and glow layers, so you or Claude can keep working on it.
+- **Precise graphics:** clean text, logos, game UI, diagrams, technical shapes, and true pixel art.
+- **Consistency:** the same character or asset can be redrawn from a script, so a series stays on-model.
+
+A strong workflow is to combine them: use a generated image as a reference with `place_image`, then build a clean, layered, controllable version on top.
 
 ## How it works
 
@@ -62,12 +73,15 @@ Optional environment variables:
 
 | Area | Tools |
 |---|---|
-| General | `status`, `launch_krita`, `look` (shows Claude the canvas, a layer or a region) |
+| General | `status`, `launch_krita`, `look` (canvas, one layer or a region; `grid` overlay with coordinates; `grayscale` to check values) |
 | Documents | `new_document`, `open_document`, `list_documents`, `switch_document`, `resize_canvas`, `scale_image`, `save` (.kra/.psd/.ora), `export_image` (.png/.jpg/.webp…, resize, crop, single layer), `close_document` |
-| Layers | `list_layers`, `add_layer`, `set_layer` (rename, opacity, blend mode, visibility, lock, alpha lock, reorder), `select_layer`, `delete_layer`, `duplicate_layer`, `merge_down`, `flatten`, `clear_layer`, `fill_layer`, `place_image` |
+| Layers | `list_layers`, `add_layer`, `set_layer` (rename, opacity, blend mode, visibility, lock, alpha lock, `clipped` for clipping-mask style layers, reorder), `select_layer`, `delete_layer`, `duplicate_layer`, `merge_down`, `flatten`, `clear_layer`, `fill_layer`, `place_image` |
 | Brushes | `list_brushes`, `set_brush` (preset, size, color, opacity, flow, blend, eraser), `get_brush` |
-| Painting | `draw_strokes` (brush strokes, optional per-point pressure, smoothed curves), `draw_shapes` (rect, ellipse, circle, polygon, line, smooth path with outline and/or fill), `add_svg` (vector layer, optionally rasterized), `set_pixels` (pixel art from character rows and a palette), `get_pixels` |
-| Other | `select`, `list_filters`, `filter_settings`, `apply_filter`, `run_action`, `list_actions`, `undo`, `redo`, `execute_python` |
+| Painting | `draw_strokes` (engines: `brush` = Krita presets with pressure; `ink`, `pencil`, `charcoal`, `marker` = clean variable-width strokes with tapers and grain; each stroke has one opacity, so segments don't overlap darker), `draw_shapes` (brush-outlined shapes), `set_pixels`, `get_pixels` |
+| Rendering | `paint` (antialiased shapes with flat colors or linear, radial or conical gradients, per-shape erase), `paint_svg` (SVG with gradients straight onto a layer), `add_svg` (editable vector layer). All take `mode` (blend mode), `clip` (only where paint exists), `blur` (soft edges, glows) and `new_layer`. |
+| Procedural | `scatter_strokes` (grass, fur, scratches, sparks, dust), `hatch` (hatching and cross-hatching in any polygon) |
+| Selection & masks | `select` (rect, ellipse, circle, polygon, smooth path, shapes, SVG, a layer's paint, invert; add, subtract or intersect; feather, grow, shrink), `add_mask` (transparency mask) |
+| Other | `art_guide` (workflow advice for complex pictures), `list_filters`, `filter_settings`, `apply_filter`, `run_action`, `list_actions`, `undo` (a whole call), `redo`, `execute_python` |
 
 Coordinates are document pixels with the origin at the top left. Stroke points can be `[x, y]` or `[x, y, pressure]`:
 
@@ -76,10 +90,21 @@ Coordinates are document pixels with the origin at the top left. Stroke points c
  "preset": "Ink-3 Gpen", "size": 16, "color": "#24323f"}
 ```
 
+## How the painting works
+
+Krita's scripting API can paint brush strokes but can't do gradients, variable-width ink or blend-mode compositing, and its raw pixel writes can't be undone. The plugin handles this as follows:
+
+- **Brush strokes** are painted with your real brush presets into a hidden scratch document. They then land on your layer in one step, so a 200-segment pressure stroke is still one undo step and one even opacity.
+- **Ink, gradients, SVG and fills** are rendered with Qt's painter, then committed through a temporary layer that is merged down. Merges are undoable, and the commit applies the blend mode, the selection, clipping and blur.
+- **`undo`** reads Krita's undo history to count how many steps a call made, and undoes all of them.
+
 ## Development
 
-- `tools/smoke_test.py [out_dir]` draws the test scene above and exports PNG, KRA and a `look` image.
-- `tools/dev_reload.py` reloads the plugin code inside a running Krita after you copy the changed files into `pykrita/krita_mcp`, so you don't have to restart Krita.
+- `tools/smoke_test.py [out_dir]` draws a simple test scene and exports PNG, KRA and a `look` image.
+- `tools/feature_test.py [out_dir]` checks gradients, blur, clipping, selections, ink engines, masks and whole-call undo.
+- `examples/scifi_soldier.py [stage] [out_dir]` paints the picture at the top.
+- `tools/restart_krita.py` restarts Krita so a changed plugin loads cleanly. This discards unsaved changes in open documents.
+- `tools/dev_reload.py` hot-reloads the plugin without a restart. It's faster but can leave old code wired in, so restart Krita if anything behaves oddly.
 
 ## Security
 
