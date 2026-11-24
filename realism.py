@@ -440,6 +440,78 @@ def painterly(img, sizes=(24, 12, 6, 3), threshold=0.06, max_length=10, curvatur
     return out
 
 
+# ----------------------------------------------------------------------------- line-art coloring
+
+def fill_line_art(lines, seeds, background_seeds=(), gap=2, default_color=None, line_threshold=0.3):
+    """Flat colors for drawn line art (like a bucket fill / colorize mask).
+    lines: RGBA of the line layer. seeds: [(x, y, color)] - each fills the enclosed area it is in.
+    Areas touching the top/left/right canvas edge, or containing a background seed, stay empty.
+    gap: line gaps up to about 2*gap px are treated as closed. Unseeded enclosed areas get
+    default_color (if given). Color is grown under the lines, so no white halos.
+    Returns RGBA (H x W x 4)."""
+    H, W = lines.shape[:2]
+    ink = lines[..., 3] > line_threshold
+    closed = ndimage.binary_dilation(ink, iterations=max(0, int(gap))) if gap > 0 else ink
+    labels, n = ndimage.label(~closed)
+    bg = set(np.unique(np.concatenate([labels[0, :], labels[:, 0], labels[:, -1]])).tolist())
+    bg.discard(0)
+
+    def label_at(x, y):
+        x, y = int(round(x)), int(round(y))
+        for r in range(0, 12):
+            ys, xs = slice(max(0, y - r), min(H, y + r + 1)), slice(max(0, x - r), min(W, x + r + 1))
+            vals = labels[ys, xs]
+            vals = vals[vals > 0]
+            if vals.size:
+                return int(np.bincount(vals).argmax())
+        return 0
+
+    for x, y in background_seeds:
+        lb = label_at(x, y)
+        if lb:
+            bg.add(lb)
+    color_of = {}
+    leaked = []
+    for i, (x, y, c) in enumerate(seeds):
+        lb = label_at(x, y)
+        if lb and lb not in bg:
+            if lb in color_of and not np.allclose(color_of[lb], rgb(c)):
+                leaked.append({"seed": i, "at": [round(x), round(y)], "problem": "shares an area with another seed"})
+            color_of[lb] = rgb(c)
+        else:
+            leaked.append({"seed": i, "at": [round(x), round(y)], "problem": "area is open to the background"})
+    fill_line_art.last_report = leaked
+    out = np.zeros((H, W, 4), np.float32)
+    filled = np.zeros((H, W), bool)
+    if default_color is not None:
+        dc = rgb(default_color)
+        for lb in range(1, n + 1):
+            if lb not in bg and lb not in color_of:
+                color_of[lb] = dc
+    lut = np.zeros((n + 1, 3), np.float32)
+    has = np.zeros(n + 1, bool)
+    for lb, c in color_of.items():
+        lut[lb] = c
+        has[lb] = True
+    filled = has[labels]
+    out[..., :3] = lut[labels]
+    # grow colors under the lines/gaps, but only inside the figure (not into the background)
+    background = np.isin(labels, list(bg)) if bg else np.zeros((H, W), bool)
+    inside = ~background & ~(labels == 0) | (closed & ~background)
+    # pixels of lines bordering background count as outside unless enclosed: dilate background a bit
+    outside = ndimage.binary_dilation(background, iterations=max(1, int(gap))) & closed
+    region = (filled | (closed & ~outside)) & ~background
+    if filled.any():
+        _, (iy, ix) = ndimage.distance_transform_edt(~filled, return_indices=True)
+        grown = out[..., :3][iy, ix]
+        out[..., :3] = np.where(filled[..., None], out[..., :3], grown)
+    out[..., 3] = np.where(region | filled, 1.0, 0.0)
+    # keep the outer edge under the lines too (lines sit on top and hide it)
+    out[..., 3] = np.maximum(out[..., 3], (ink & ~background & ndimage.binary_dilation(filled, iterations=3 + int(gap))))
+    out[..., 3] = gblur(out[..., 3], 0.6) * (out[..., 3] > 0)
+    return out
+
+
 # ----------------------------------------------------------------------------- shadows
 
 def cast_shadow(alpha, base_y, base_x, direction=(0.6, -0.25), softness=12.0, falloff=0.6, contact=0.9,
@@ -579,6 +651,8 @@ def naturalize(stroke, size, amount=0.5, seed=1):
         res.append([a[k] + (b[k] - a[k]) * f for k in range(3)])
     wob = noise1d(len(res), max(2, total / 120), seed)
     amp = amount * min(0.012 * total + 0.25 * size, 6 + size)
+    if stroke.get("closed"):          # a closed outline must end where it starts
+        wob = [w * math.sin(math.pi * i / max(1, len(wob) - 1)) for i, w in enumerate(wob)]
     out = []
     for i, (x, y, p) in enumerate(res):
         a = res[max(i - 1, 0)]
@@ -593,7 +667,7 @@ def naturalize(stroke, size, amount=0.5, seed=1):
         p = max(0.05, p * (1 + 0.15 * amount * wob[(i * 7) % len(wob)]))
         out.append([round(x + nx * wob[i] * amp, 2), round(y + ny * wob[i] * amp, 2), round(p, 3)])
     # overshoot past the ends, lifting off
-    ov = amount * min(0.05 * total, 3 * size)
+    ov = amount * min(0.05 * total, 3 * size) if stroke.get("overshoot", True) else 0.0
     if ov > 0.5:
         for end, nb, sign in ((out[-1], out[-2], 1), (out[0], out[1], -1)):
             dx, dy = end[0] - nb[0], end[1] - nb[1]

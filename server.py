@@ -737,6 +737,31 @@ def painterly(layer: str | None = None, new_layer: str | None = "Painterly", siz
 
 
 @mcp.tool()
+def fill_line_art(line_layer: str, seeds: list[list], background_seeds: list[list[float]] | None = None,
+                  gap: int = 2, default_color: str | None = None, new_layer: str = "Flats",
+                  document: str | None = None) -> dict:
+    """Color drawn line art the way artists do (bucket fill / colorize mask): every enclosed area
+    between the lines that contains a seed [x, y, color] is filled with that color. Areas open to the
+    top/left/right canvas edge (or containing a background seed [x, y]) stay empty. gap closes small
+    breaks in the lines (px). default_color fills enclosed areas you didn't seed. The color extends
+    under the lines so there are no halos. Result: a new layer just below the line layer - then
+    render_form it, shade with strokes, etc."""
+    lines = _get(line_layer, document)
+    out = realism.fill_line_art(lines, [tuple(s) for s in seeds],
+                                [tuple(b) for b in (background_seeds or [])], gap, default_color)
+    bb = _bbox(out[..., 3], 1)
+    if bb is None:
+        return {"error": "No enclosed area was filled - check that the seeds are inside closed lines."}
+    x0, y0, x1, y1 = bb
+    r = _put(out[y0:y1, x0:x1], x0, y0, new_layer=new_layer, below=line_layer, use_selection=False,
+             document=document)
+    problems = getattr(realism.fill_line_art, "last_report", [])
+    if problems:
+        r["seed_problems"] = problems   # leaks: close the line gap near there, or raise gap
+    return r
+
+
+@mcp.tool()
 def cast_shadow(layer: str, direction: list[float] = [0.7, -0.22], base_y: float | None = None,
                 base_x: float | None = None, color: str = "#0a0c12", opacity: float = 0.75,
                 softness: float = 14, falloff: float = 0.6, contact: float = 0.9, contact_size: float = 6,

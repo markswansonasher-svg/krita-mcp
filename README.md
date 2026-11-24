@@ -26,6 +26,12 @@ The soldier scene again, with `render_form` on the hallway and armor, texture, a
 
 ![The sci-fi soldier with computed lighting, metal reflections and a painterly finish](docs/scifi-soldier-real.png)
 
+The same soldier **drawn line by line** instead of built from shapes ([`examples/scifi_soldier_drawn.py`](examples/scifi_soldier_drawn.py)). Every edge is a hand-drawn ink stroke with curved contours, a line-weight hierarchy, natural wobble and tapered detail lines. Lines hidden behind the rifle and arms are erased, as an inker would. The drawing is then colored between the lines with **`fill_line_art`** (like a bucket fill or Krita's colorize mask) and lit with `render_form`:
+
+![The soldier drawn as line art, colored and lit](docs/scifi-soldier-drawn.png)
+
+`fill_line_art` reports any seed whose area leaks to the background or shares an area with another seed, so gaps in the lines are easy to find and close.
+
 The heavy image work (numpy, SciPy, Pillow) runs in the MCP server, so the Krita plugin stays lightweight. `uv` installs these the first time the server starts.
 
 ## Where this stands next to image generators
@@ -103,7 +109,7 @@ Optional environment variables:
 | Rendering | `paint` (antialiased shapes with flat colors or linear, radial or conical gradients, per-shape erase), `paint_svg` (SVG with gradients straight onto a layer), `add_svg` (editable vector layer). All take `mode` (blend mode), `clip` (only where paint exists), `blur` (soft edges, glows) and `new_layer`. |
 | Procedural | `scatter_strokes` (grass, fur, scratches, sparks, dust), `hatch` (hatching and cross-hatching in any polygon) |
 | Selection & masks | `select` (rect, ellipse, circle, polygon, smooth path, shapes, SVG, a layer's paint, invert; add, subtract or intersect; feather, grow, shrink), `add_mask` (transparency mask) |
-| Realism | `render_form` (lit 3D forms from flat shapes, with materials), `texture`, `cast_shadow`, `painterly`; `tube` and `blob` shapes; `natural` and `passes` for strokes |
+| Realism | `fill_line_art` (color drawn line art between its lines), `render_form` (lit 3D forms from flat shapes, with materials), `texture`, `cast_shadow`, `painterly`; `tube` and `blob` shapes; `natural` and `passes` for strokes |
 | Other | `art_guide` (workflow advice for complex pictures), `list_filters`, `filter_settings`, `apply_filter`, `run_action`, `list_actions`, `undo` (a whole call), `redo`, `execute_python` |
 
 Coordinates are document pixels with the origin at the top left. Stroke points can be `[x, y]` or `[x, y, pressure]`:
