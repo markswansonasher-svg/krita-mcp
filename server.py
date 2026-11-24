@@ -1,6 +1,6 @@
 # /// script
 # requires-python = ">=3.10"
-# dependencies = ["mcp>=1.2,<2"]   # mcp 2.x renamed FastMCP
+# dependencies = ["mcp>=1.2,<2", "numpy>=1.26", "scipy>=1.11", "pillow>=10"]   # mcp 2.x renamed FastMCP
 # ///
 """
 Krita MCP - lets Claude (or any MCP client) draw in Krita.
@@ -29,6 +29,10 @@ from typing import Any
 
 from mcp.server.fastmcp import FastMCP, Image
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import numpy as np  # noqa: E402
+import realism  # noqa: E402  (numpy/scipy/Pillow work happens here, in the server)
+
 PORT = int(os.environ.get("KRITA_MCP_PORT", "9877"))
 HOST = "127.0.0.1"
 mcp = FastMCP(
@@ -36,6 +40,8 @@ mcp = FastMCP(
     instructions=(
         "Drives the user's live Krita. Start with status (or launch_krita if Krita is closed). "
         "Coordinates are document pixels, origin top-left. For a real illustration read art_guide first. "
+        "For realism: paint parts flat (tube/blob/polygon shapes), then render_form lights them as 3D "
+        "forms; add texture, cast_shadow and an optional painterly pass. "
         "Block in with paint / paint_svg (shapes, gradients, blend modes, clip, blur), render light and "
         "shadow as separate clipped multiply/screen passes, draw lines with draw_strokes (engine ink / "
         "pencil / brush with presets), texture with scatter_strokes and hatch, limit work with select "
@@ -121,12 +127,17 @@ def launch_krita(wait_seconds: int = 90) -> dict:
     subprocess.Popen([exe], creationflags=flags, close_fds=True,
                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     end = time.time() + wait_seconds
+    last = None
     while time.time() < end:
         time.sleep(2)
         try:
-            return {"started": True, **call("ping")}
+            last = call("ping")
         except KritaNotRunning:
             continue
+        if last.get("windows"):
+            return {"started": True, **last}
+    if last and last.get("dialogs"):
+        raise RuntimeError(f"Krita is waiting on a dialog: {last['dialogs']}. Ask the user to answer it in Krita.")
     raise RuntimeError("Krita started but the bridge didn't answer. Check that the 'Krita MCP (Claude)' "
                        "plugin is enabled in Settings > Configure Krita > Python Plugin Manager.")
 
@@ -328,8 +339,13 @@ def draw_strokes(strokes: list[dict], engine: str = "brush", layer: str | None =
                  new_layer: str | None = None, preset: str | None = None, size: float | None = None,
                  color: str | dict | None = None, opacity: float | None = None, mode: str = "normal",
                  clip: bool = False, blur: float = 0, taper: float | None = None, grain: float | None = None,
-                 smooth: bool = True, document: str | None = None) -> dict:
+                 smooth: bool = True, natural: float = 0.0, passes: int = 1, seed: int = 1,
+                 document: str | None = None) -> dict:
     """Paint strokes. Points are [x, y] or [x, y, pressure 0-1]. Send many strokes per call.
+
+    natural 0-1: make lines feel hand-drawn - a gentle wobble, pressure that swells and lifts (when
+    no pressure is given) and a slight overshoot at the ends. 0.3-0.6 is a good range for line art.
+    passes > 1: sketchy look - each stroke is drawn several times, slightly different, lighter.
 
     engine (per call, or "engine" per stroke):
       "brush"    Krita's brush engine with a preset (list_brushes) - textured, painterly marks.
@@ -342,6 +358,18 @@ def draw_strokes(strokes: list[dict], engine: str = "brush", layer: str | None =
     whole call (normal, multiply, screen, overlay, add, color_dodge, soft_light, erase...).
     clip: only where the layer already has paint. blur: soften (px). new_layer: paint on a new layer.
     Painting respects the current selection. One call = one undo step."""
+    if natural > 0 or passes > 1:
+        out = []
+        for i, st in enumerate(strokes):
+            sz = float(st.get("size") or size or 6)
+            for k in range(max(1, passes)):
+                amount = max(natural, 0.35 if passes > 1 else 0.0)
+                ns = realism.naturalize(st, sz, amount, seed * 1000 + i * 17 + k)
+                if passes > 1:
+                    base_op = float(st.get("opacity", opacity if opacity is not None else 1.0))
+                    ns = dict(ns, opacity=base_op * (0.55 if k else 0.85))
+                out.append(ns)
+        strokes = out
     return call("draw_strokes", strokes=strokes, engine=engine, layer=layer, new_layer=new_layer,
                 preset=preset, size=size, color=color, opacity=opacity, mode=mode, clip=clip, blur=blur,
                 taper=taper, grain=grain, smooth=smooth, document=document)
@@ -405,7 +433,7 @@ def select(mode: str = "rect", rect: list[int] | None = None, shapes: list[dict]
       | "svg" (svg markup in doc pixels) | "layer" (everything painted on a layer) | "all" | "none" |
       "invert" | "modify" (only apply feather/grow/shrink to the current selection).
     op: replace | add | subtract | intersect. feather: soft edge (px). grow/shrink in px."""
-    return call("select", mode=mode, rect=rect, shapes=shapes, svg=svg, layer=layer, op=op, feather=feather,
+    return call("select", mode=mode, rect=rect, shapes=realism.expand_shapes(shapes), svg=svg, layer=layer, op=op, feather=feather,
                 grow=grow, shrink=shrink, x=x, y=y, w=w, h=h, cx=cx, cy=cy, r=r, points=points,
                 smooth=smooth, document=document)
 
@@ -471,8 +499,12 @@ def paint(shapes: list[dict], layer: str | None = None, new_layer: str | None = 
     lighting and shading. All shapes of one call are composited together (one undo step).
 
     shape: {"type": "rect" (x,y,w,h, radius) | "ellipse" (x,y,w,h) | "circle" (cx,cy,r) |
-            "polygon" (points) | "path" (points, "smooth": true curve through them, "closed"),
-            "fill": color or gradient, "stroke": color or gradient, "stroke_width", "opacity"}
+            "polygon" (points) | "path" (points, "smooth": true curve through them, "closed") |
+            "tube" (spine [[x, y, radius], ...] - smooth organic limbs, fingers, tentacles, branches,
+                    horns, hair locks; radius may vary along it) |
+            "blob" (cx, cy, rx, ry, rotation, wobble 0-0.5, lumps, seed - rocks, clouds, muscles, bushes),
+            "fill": color or gradient, "stroke": color or gradient, "stroke_width", "opacity",
+            "erase": true (cut this shape out of what the call drew so far)}
     color: "#rrggbb", "#rrggbbaa", "red" or [r,g,b,a].
     gradient: {"type": "linear", "x1","y1","x2","y2", "stops": [[0,"#000"],[1,"#fff0"]]}
               {"type": "radial", "cx","cy","r", optional focal "fx","fy", "stops": [...]}
@@ -481,8 +513,8 @@ def paint(shapes: list[dict], layer: str | None = None, new_layer: str | None = 
     mode: blend mode against the layer (normal, multiply = shadows, screen/add/color_dodge = light,
           overlay, soft_light, erase = cut away). clip: only where the layer already has paint
           (shade inside a form). blur: soft edges in px (glows, soft shadows, atmosphere)."""
-    return call("paint", shapes=shapes, layer=layer, new_layer=new_layer, mode=mode, opacity=opacity,
-                clip=clip, blur=blur, document=document)
+    return call("paint", shapes=realism.expand_shapes(shapes), layer=layer, new_layer=new_layer, mode=mode,
+                opacity=opacity, clip=clip, blur=blur, document=document)
 
 
 @mcp.tool()
@@ -501,7 +533,8 @@ def add_mask(layer: str | None = None, shapes: list[dict] | None = None, feather
              name: str = "Mask", document: str | None = None) -> dict:
     """Add a transparency mask to a layer: from shapes (see `paint`), or from the current selection.
     Non-destructive - the layer only shows inside the mask."""
-    return call("add_mask", layer=layer, shapes=shapes, feather=feather, name=name, document=document)
+    return call("add_mask", layer=layer, shapes=realism.expand_shapes(shapes), feather=feather, name=name,
+                document=document)
 
 
 # ----------------------------------------------------------------------------- procedural marks
@@ -606,6 +639,163 @@ def hatch(region: list[list[float]] | list[float], angle: float = 45, spacing: f
                 layer=layer, new_layer=new_layer, mode=mode, smooth=False, document=document)
 
 
+# ----------------------------------------------------------------------------- realism (server-side)
+
+def _get(layer=None, document=None):
+    r = call("get_image", layer=layer, document=document)
+    return realism.decode_png(r["png_base64"])
+
+
+def _bbox(alpha, pad=4):
+    ys, xs = (alpha > 0.002).nonzero()
+    if len(xs) == 0:
+        return None
+    h, w = alpha.shape
+    return (max(0, int(xs.min()) - pad), max(0, int(ys.min()) - pad),
+            min(w, int(xs.max()) + pad + 1), min(h, int(ys.max()) + pad + 1))
+
+
+def _put(arr, x, y, **kw):
+    return call("put_image", png_base64=realism.encode_png(arr), x=int(x), y=int(y), timeout=300, **kw)
+
+
+@mcp.tool()
+def render_form(layer: str, material: str = "painted_metal", profile: str = "round", radius: float = 24,
+                by_color: bool = True, depth: float = 1.0, key_angle: float = 135, key_elevation: float = 40,
+                key_color: str = "#fff4e0", key_intensity: float = 1.0, fill_color: str = "#4a6080",
+                fill_intensity: float = 0.35, sky_color: str = "#9fc6e8", ground_color: str = "#3a2f28",
+                ambient: float = 0.35, rim_angle: float | None = None, rim_color: str = "#bff4ff",
+                rim_intensity: float = 0.0, ao: float = 0.6, env_sky: str = "#cfe8ff",
+                env_ground: str = "#2b2622", bump: float | None = None, bump_scale: float = 6,
+                material_overrides: dict | None = None, new_layer: str | None = None,
+                document: str | None = None) -> dict:
+    """Turn the flat shapes on a layer into lit 3D forms - the biggest single step toward realism.
+
+    It builds a height field from the silhouette (each flat-color region is its own form when
+    by_color=true, so armor plates, fingers, petals... each get their own rounded edge), then lights
+    it: key light, fill light, sky/ground ambient, ambient occlusion in creases, specular highlights,
+    rim light, environment reflections (metal) and subsurface glow (skin, leaves).
+
+    Paint parts flat first (paint with tube/blob/polygon shapes, a distinct color per part), then call
+    this. profile: round (rounded edges of `radius` px) | dome (each region fully rounded, like a
+    pillow or sphere) | bevel (chamfered hard-surface) | pillow (soft) | flat.
+    material: matte, plastic, metal, painted_metal, skin, cloth, stone, wood, glass, leaf
+      (material_overrides: diffuse, specular, shininess, metalness, wrap, subsurface, sheen).
+    Lights: angles in degrees the light comes FROM (0 = right, 90 = top, 180 = left), elevation
+    0-90. rim_intensity > 0 adds a rim light from rim_angle (default: opposite the key).
+    bump adds surface relief (stone, worn metal, skin pores); bump_scale is its size in px.
+    The layer is replaced with the rendered version (undo restores it); new_layer keeps the original."""
+    img = _get(layer, document)
+    bb = _bbox(img[..., 3])
+    if bb is None:
+        return {"error": f"Layer {layer!r} is empty."}
+    x0, y0, x1, y1 = bb
+    out = realism.render_form(img[y0:y1, x0:x1], material=material, profile=profile, radius=radius,
+                              by_color=by_color, depth=depth, key_angle=key_angle, key_elevation=key_elevation,
+                              key_color=key_color, key_intensity=key_intensity, fill_color=fill_color,
+                              fill_intensity=fill_intensity, sky_color=sky_color, ground_color=ground_color,
+                              ambient=ambient, rim_angle=rim_angle, rim_color=rim_color,
+                              rim_intensity=rim_intensity, ao=ao, env_sky=env_sky, env_ground=env_ground,
+                              bump=bump, bump_scale=bump_scale, overrides=material_overrides)
+    if new_layer:
+        return _put(out, x0, y0, new_layer=new_layer, above=layer, document=document)
+    return _put(out, x0, y0, layer=layer, replace=True, use_selection=False, document=document)
+
+
+@mcp.tool()
+def painterly(layer: str | None = None, new_layer: str | None = "Painterly", sizes: list[int] = [24, 12, 6, 3],
+              threshold: float = 0.06, stroke_length: int = 10, curvature: float = 0.6, bristles: bool = True,
+              color_jitter: float = 0.04, opacity: float = 1.0, region: list[int] | None = None, seed: int = 7,
+              document: str | None = None) -> dict:
+    """Repaint an image with real-looking brushwork: long curved strokes that follow the forms
+    (along edges and gradients), coarse to fine - big strokes for broad areas, small ones only where
+    detail needs them - with bristle texture and slight color variation. Turns vector-clean renders
+    into something that reads as painted.
+
+    Source: a layer (layer=...) or the whole visible canvas (layer=None). The result goes to new_layer
+    (default "Painterly", on top) - lower its opacity or mask it to mix with the original; or pass
+    new_layer=None with a layer to replace that layer. sizes: brush radii in px, coarse -> fine.
+    threshold: lower = more fine strokes (more detail). region: [x, y, w, h] to limit the work."""
+    img = _get(layer, document)
+    H, W = img.shape[:2]
+    if region:
+        x0, y0, w, h = [int(v) for v in region]
+        x1, y1 = min(W, x0 + w), min(H, y0 + h)
+        x0, y0 = max(0, x0), max(0, y0)
+    else:
+        bb = _bbox(img[..., 3], 0)
+        if bb is None:
+            return {"error": "Nothing to paint."}
+        x0, y0, x1, y1 = bb
+    out = realism.painterly(img[y0:y1, x0:x1], sizes=tuple(sizes), threshold=threshold, max_length=stroke_length,
+                            curvature=curvature, bristles=bristles, color_jitter=color_jitter, seed=seed)
+    if new_layer:
+        above = layer or call("list_layers", document=document)["layers"][0]["name"]   # default: on top
+        return _put(out, x0, y0, new_layer=new_layer, above=above, opacity=opacity, use_selection=False,
+                    document=document)
+    return _put(out, x0, y0, layer=layer, replace=True, use_selection=False, document=document)
+
+
+@mcp.tool()
+def cast_shadow(layer: str, direction: list[float] = [0.7, -0.22], base_y: float | None = None,
+                base_x: float | None = None, color: str = "#0a0c12", opacity: float = 0.75,
+                softness: float = 14, falloff: float = 0.6, contact: float = 0.9, contact_size: float = 6,
+                target_layer: str | None = None, document: str | None = None) -> dict:
+    """Ground shadow cast by the shapes on a layer - grounds objects so they stop floating.
+    direction: where the shadow falls per pixel of object height, [dx, dy] on screen, e.g.
+    [0.7, -0.22] = to the right and slightly back (light from the front-left), [-1.2, -0.1] = long to
+    the left, [0.1, 0.35] = short, toward the viewer (light from behind). base_y / base_x: the ground
+    contact point (default: bottom-center of the layer's paint). Sharp near the contact, softer and
+    fainter farther away (softness px, falloff 0-1), plus a dark contact shadow right at the base.
+    Goes on a new layer just below the object (or onto target_layer, multiplied)."""
+    img = _get(layer, document)
+    alpha = img[..., 3]
+    bb = _bbox(alpha, 0)
+    if bb is None:
+        return {"error": f"Layer {layer!r} is empty."}
+    x0, y0, x1, y1 = bb
+    by = float(base_y if base_y is not None else y1 - 1)
+    bx = float(base_x if base_x is not None else (x0 + x1) / 2)
+    sh = realism.cast_shadow(alpha, by, bx, tuple(direction), softness, falloff, contact, contact_size)
+    bb2 = _bbox(sh, 2)
+    if bb2 is None:
+        return {"error": "The shadow fell outside the canvas."}
+    sx0, sy0, sx1, sy1 = bb2
+    out = realism.colorize(np.zeros((sy1 - sy0, sx1 - sx0), np.float32), color, color, alpha=sh[sy0:sy1, sx0:sx1])
+    if target_layer:
+        return _put(out, sx0, sy0, layer=target_layer, mode="multiply", opacity=opacity, document=document)
+    name = f"{layer} shadow"
+    r = _put(out, sx0, sy0, new_layer=name, below=layer, opacity=opacity, document=document)
+    call("set_layer", layer=name, blend_mode="multiply", document=document)
+    return r
+
+
+@mcp.tool()
+def texture(layer: str, kind: str = "grime", scale: float = 32, dark: str = "#000000", light: str = "#ffffff",
+            mode: str = "overlay", opacity: float = 0.5, contrast: float = 1.0, clip: bool = True,
+            rect: list[int] | None = None, seed: int = 1, new_layer: str | None = None,
+            document: str | None = None) -> dict:
+    """Procedural surface detail blended onto a layer (clipped to its paint by default).
+    kind: grain (fine noise), fbm/clouds (soft variation), grime/rust (dirty patches), scratches,
+    cells (cracks, scales), stone, fabric. The pattern is mapped from `dark` to `light` and blended with
+    `mode` (overlay / soft_light keep the color and add detail, multiply for dirt, screen for wear).
+    scale: feature size in px."""
+    img = _get(layer, document)
+    H, W = img.shape[:2]
+    if rect:
+        x0, y0, w, h = [int(v) for v in rect]
+        x1, y1 = min(W, x0 + w), min(H, y0 + h)
+    else:
+        bb = _bbox(img[..., 3]) if clip else (0, 0, W, H)
+        if bb is None:
+            return {"error": f"Layer {layer!r} is empty."}
+        x0, y0, x1, y1 = bb
+    t = realism.texture(y1 - y0, x1 - x0, kind=kind, scale=scale, seed=seed, contrast=contrast)
+    out = realism.colorize(t, dark, light)
+    if new_layer:
+        return _put(out, x0, y0, new_layer=new_layer, above=layer, mode=mode, opacity=opacity, document=document)
+    return _put(out, x0, y0, layer=layer, mode=mode, opacity=opacity, clip=clip, document=document)
+
 # ----------------------------------------------------------------------------- guidance
 
 ART_GUIDE = r"""
@@ -622,7 +812,19 @@ HOW TO MAKE A STRONG PICTURE WITH THESE TOOLS
 2. Block in flat silhouettes first (paint / paint_svg with flat colors). Check look(grayscale=true):
    the subject must read as a clear shape against its background before any detail.
 
-3. Light and form, in this order, each its own pass:
+2b. REALISM FAST PATH: paint each part flat in its own color (paint with "tube" shapes for limbs,
+   fingers, tentacles, branches; "blob" for rocks, muscles, clouds; polygons for hard surface), then
+   render_form(layer, material=..., profile=...) computes real light: rounded or bevelled volume,
+   key/fill/sky light, ambient occlusion, specular, rim, metal reflections, skin subsurface glow.
+   Match its light angles to the scene's light sources. Then texture(...) for grime/scratches/stone,
+   cast_shadow(...) to ground objects, and optionally painterly(...) (opacity 0.4-0.7) at the end
+   so it reads as painted. Do not paint tiny detail marks before render_form - each mark becomes its
+   own little bump; add detail after it.
+
+   NATURAL LINES: draw_strokes(..., natural=0.3-0.6) gives hand-drawn wobble, pressure and overshoot;
+   passes=2-3 gives a sketchy look. Prefer few long confident strokes over many short ones.
+
+3. Light and form by hand (for stylized work, or on top of render_form), each its own pass:
    - form shadow: paint(mode="multiply", clip=true, blur=6-20) with a cool dark on the side away
      from the light;  - occlusion: small dark multiply blurs where forms meet;
    - key light: paint(mode="screen" or "add", clip=true) with warm light on surfaces facing the light;

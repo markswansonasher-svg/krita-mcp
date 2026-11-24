@@ -352,20 +352,27 @@ def render_ink_strokes(strokes, doc_w, doc_h, defaults):
         return None
     out = new_image(bx1 - bx, by1 - by)
     for st, samples in pieces:
-        mask = new_image(out.width(), out.height())
+        # work in this stroke's own small box (fast even with thousands of strokes)
+        sx0 = max(bx, int(math.floor(min(x - r for x, y, r in samples))) - pad)
+        sy0 = max(by, int(math.floor(min(y - r for x, y, r in samples))) - pad)
+        sx1 = min(bx1, int(math.ceil(max(x + r for x, y, r in samples))) + pad)
+        sy1 = min(by1, int(math.ceil(max(y + r for x, y, r in samples))) + pad)
+        if sx1 <= sx0 or sy1 <= sy0:
+            continue
+        sw, sh = sx1 - sx0, sy1 - sy0
+        mask = new_image(sw, sh)
         p = QPainter(mask)
         p.setRenderHint(QPainter.Antialiasing)
-        p.translate(-bx, -by)
+        p.translate(-sx0, -sy0)
         p.setBrush(QBrush(QColor(255, 255, 255)))
         paint_ink(p, samples)
         p.end()
         if st.get("grain"):
-            apply_grain(mask, float(st["grain"]), int(st.get("grain_scale", 1)), bx, by)
-        # color the mask
-        layer = new_image(out.width(), out.height())
+            apply_grain(mask, float(st["grain"]), int(st.get("grain_scale", 1)), sx0, sy0)
+        layer = new_image(sw, sh)
         p = QPainter(layer)
-        p.translate(-bx, -by)
-        p.fillRect(QRectF(bx, by, out.width(), out.height()), brush_for(st.get("color", "#000000")))
+        p.translate(-sx0, -sy0)
+        p.fillRect(QRectF(sx0, sy0, sw, sh), brush_for(st.get("color", "#000000")))
         p.end()
         mask_with(layer, mask)
         p = QPainter(out)
@@ -373,7 +380,7 @@ def render_ink_strokes(strokes, doc_w, doc_h, defaults):
         mode = st.get("mode", "normal")
         p.setCompositionMode(QPainter.CompositionMode_DestinationOut if mode == "erase"
                              else QPainter.CompositionMode_SourceOver)
-        p.drawImage(0, 0, layer)
+        p.drawImage(sx0 - bx, sy0 - by, layer)
         p.end()
     return out, bx, by
 

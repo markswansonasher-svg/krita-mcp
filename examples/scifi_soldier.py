@@ -6,7 +6,7 @@ A tiny pinhole camera (0.45 m above the floor, tilted up 14 degrees, long lens) 
 soldier's body points, so the perspective is a true low-angle three-point view.
 
     uv run --with "mcp>=1.2,<2" python examples/scifi_soldier.py [stage] [out_dir]
-stage: all (default), hall, soldier, finish
+stage: all (default), hall, soldier, finish;  add "real" as a third argument for the v0.3 realism pass
 """
 import math
 import os
@@ -25,6 +25,8 @@ Z_SOLDIER = 3.4
 
 STAGE = sys.argv[1] if len(sys.argv) > 1 else "all"
 OUT = os.path.abspath(sys.argv[2] if len(sys.argv) > 2 else "soldier-out")
+# "real": light the forms with render_form, add material texture and a painterly pass (v0.3 tools)
+REAL = len(sys.argv) > 3 and sys.argv[3] == "real"
 
 
 def proj(x, y, z):
@@ -122,6 +124,12 @@ def stage_hall():
                 " L".join(f"{p[0]} {p[1]}" for p in inner) + " Z"
             svg.append(f'<path fill-rule="evenodd" d="{d}" fill="{fogged(col, zz, 0.06)}"/>')
     k.paint_svg(layer="Hall", svg="".join(svg))
+
+    if REAL:
+        k.render_form(layer="Hall", material="painted_metal", profile="bevel", radius=4, key_angle=90,
+                      key_elevation=55, key_color="#cdf6ff", key_intensity=0.9, fill_color="#ffb070",
+                      fill_intensity=0.25, sky_color="#7fd8ea", ground_color="#3a2a20", ambient=0.45, ao=0.7,
+                      bump=0.15, bump_scale=5)
 
     # ceiling light strips (emissive) and warm accent lights on the lower bevels
     lights, warm = [], []
@@ -300,7 +308,7 @@ def stage_soldier():
         {"points": [body(0.2, 1.62, 0.14), body(0.215, 1.85, 0.14), body(0.235, 2.12, 0.14)], "size": 4,
          "color": "#3a4452", "taper": [0, 0.5]}])
     # 1) everything behind the rifle and forearms: fills + outlines in depth order
-    k.paint(layer="Base", shapes=outlined(behind))
+    k.paint(layer="Base", shapes=fills(behind) if REAL else outlined(behind))
     # 2) surface detail on those parts (later covered by the rifle where it crosses)
     acc = []
     for s in (1, -1):
@@ -316,16 +324,29 @@ def stage_soldier():
                  ((-0.1, 1.3), (0.1, 1.3)), ((0.17, 0.4), (0.2, 0.05)), ((-0.17, 0.4), (-0.2, 0.05))):
         seams.append({"points": [body(*a, -0.12), body(*b, -0.12)], "size": 1.8, "color": "#0b0e13", "opacity": 0.8})
     k.draw_strokes(layer="Base", engine="ink", smooth=False, strokes=seams)
-    k.scatter_strokes(layer="Base", region=poly([(-0.22, 1.26), (0.22, 1.26), (0.22, 1.54), (-0.22, 1.54)], -0.12),
+    if not REAL:   # (in REAL mode the scratch texture after render_form does this job)
+      k.scatter_strokes(layer="Base", region=poly([(-0.22, 1.26), (0.22, 1.26), (0.22, 1.54), (-0.22, 1.54)], -0.12),
                       count=60, length=[3, 10], angle=-20, angle_jitter=60, size=[0.7, 1.4],
                       colors=["#a5b5c8", "#0d1015"], opacity=[0.2, 0.5], seed=4, clip=True)
-    for leg in (1, -1):
+    for leg in ((1, -1) if not REAL else ()):
         k.scatter_strokes(layer="Base", region=poly([(0.14, 0.0), (0.27, 0.0), (0.24, 0.44), (0.13, 0.44)], -0.07,
                                                      mirror=leg < 0),
                           count=35, length=[3, 9], angle=-80, angle_jitter=40, size=[0.7, 1.3],
                           colors=["#a5b5c8", "#0d1015"], opacity=[0.2, 0.5], seed=5 + leg, clip=True)
     # 3) rifle, forearms and hands on top, also in depth order
-    k.paint(layer="Base", shapes=outlined(infront))
+    k.paint(layer="Base", shapes=fills(infront) if REAL else outlined(infront))
+    if REAL:
+        # computed lighting: warm key from the floor lights (lower left), cool rim from the hall behind,
+        # teal sky light from the ceiling strips, metal reflecting the corridor
+        k.render_form(layer="Base", material="painted_metal", profile="round", radius=9, depth=1.2,
+                      key_angle=215, key_elevation=24, key_color="#ffbb88", key_intensity=1.9,
+                      fill_color="#3f8fa3", fill_intensity=0.6, sky_color="#8fe6f4", ground_color="#5a4030",
+                      ambient=0.75, rim_angle=75, rim_color="#b8f8ff", rim_intensity=1.8, ao=0.6,
+                      env_sky="#d4fbff", env_ground="#6a5040", bump=0.12, bump_scale=4,
+                      material_overrides={"metalness": 0.35})
+        k.texture(layer="Base", kind="grime", scale=70, dark="#2a1e14", light="#ffffff", mode="multiply", opacity=0.3)
+        k.texture(layer="Base", kind="scratches", scale=22, dark="#000000", light="#d9ecf5", mode="screen", opacity=0.3,
+                  seed=5)
 
     # --- form shadow: a multiply layer clipped to the soldier -------------------
     k.add_layer(name="Shade", blend_mode="multiply")
@@ -334,9 +355,17 @@ def stage_soldier():
         "type": "radial", "cx": body(-0.1, 1.45)[0], "cy": body(-0.1, 1.45)[1], "r": 1050,
         "fx": body(-0.2, 1.35)[0], "fy": body(-0.2, 1.35)[1],
         "stops": [[0, "#ffffff"], [0.35, "#c3cbe0"], [0.75, "#5d6a8e"], [1, "#2f3850"]]}}])
-    # bevel/occlusion shade on the lower-right edges of every part, occluded properly
-    k.paint(layer="Shade", blur=3, opacity=0.75, shapes=depth_sequence(ordered, "#2a3248", -6, -7))
+    if REAL:
+        k.set_layer(layer="Shade", opacity=0.3)
+    else:
+        # bevel/occlusion shade on the lower-right edges of every part, occluded properly
+        k.paint(layer="Shade", blur=3, opacity=0.75, shapes=depth_sequence(ordered, "#2a3248", -6, -7))
+        stage_soldier_edge_lights(ordered, armor, helmet)
 
+    stage_soldier_glow(helmet)
+
+
+def stage_soldier_edge_lights(ordered, armor, helmet):
     # --- warm key light from the floor lights, lower left -----------------------
     k.add_layer(name="Key", blend_mode="add")
     k.set_layer(layer="Key", clipped=True)
@@ -363,7 +392,12 @@ def stage_soldier():
     k.set_layer(layer="Glints", clipped=True)
     k.draw_strokes(layer="Glints", engine="ink", strokes=spec)
 
+
+
+def stage_soldier_glow(helmet):
     # --- emissive: visor, rifle cell, chest light, with bloom ---------------------
+    top = [l["name"] for l in k.list_layers()["layers"][0].get("children", [])]
+    k.select_layer(layer=top[0] if top else "Base")
     k.add_layer(name="Glow")
     visor = [p for n, p, _ in helmet if n == "visor"][0]
     ys = [q[1] for q in visor]
@@ -379,7 +413,7 @@ def stage_soldier():
     k.paint(layer="Glow bloom", blur=18, opacity=0.9, shapes=[{"type": "polygon", "points": visor, "fill": "#ff9a2e"}])
     k.draw_strokes(layer="Glow bloom", engine="ink", blur=12, strokes=[{"points": cell, "size": 22, "color": "#2fd8ff"}])
     # visor light spilling on the jaw and gorget
-    k.select_layer(layer="Glints")
+    k.select_layer(layer="Shade")
     k.add_layer(name="Visor spill", blend_mode="add")
     k.set_layer(layer="Visor spill", clipped=True)
     vc = body(0, 1.68, -0.06)
@@ -430,6 +464,9 @@ def stage_finish():
     k.fill_layer(new_layer="Grain", color="#808080")
     k.apply_filter(filter="noise", layer="Grain", settings={"level": 60, "opacity": 100, "grayscale": True})
     k.set_layer(layer="Grain", blend_mode="overlay", opacity=0.12)
+    if REAL:
+        # painterly pass over everything: reads as a painting, original detail still shows through
+        k.painterly(new_layer="Painterly", sizes=[10, 5, 3], threshold=0.045, stroke_length=14, opacity=0.45, seed=3)
 
 
 def main():
@@ -440,9 +477,10 @@ def main():
         stage_soldier()
     if STAGE in ("all", "finish"):
         stage_finish()
-    k.save(path=os.path.join(OUT, "scifi-soldier.kra"))
-    k.export_image(path=os.path.join(OUT, f"stage-{STAGE}.png"))
-    print("exported", os.path.join(OUT, f"stage-{STAGE}.png"))
+    k.save(path=os.path.join(OUT, "scifi-soldier-real.kra" if REAL else "scifi-soldier.kra"))
+    name = f"stage-{STAGE}{'-real' if REAL else ''}.png"
+    k.export_image(path=os.path.join(OUT, name))
+    print("exported", os.path.join(OUT, name))
 
 
 if __name__ == "__main__":

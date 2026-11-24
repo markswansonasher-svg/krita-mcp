@@ -30,10 +30,10 @@ from PyQt5.QtWidgets import QAbstractItemView, QApplication, QMessageBox
 from . import raster
 
 PORT = int(os.environ.get("KRITA_MCP_PORT", "9877"))
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 
 # Commands that only read; everything else is tracked so `undo` can take back a whole call.
-READ_ONLY = {"ping", "status", "list_documents", "look", "list_layers", "list_brushes", "get_brush",
+READ_ONLY = {"ping", "status", "get_image", "list_documents", "look", "list_layers", "list_brushes", "get_brush",
              "get_pixels", "list_filters", "filter_settings", "list_actions", "save", "export_image",
              "undo", "redo", "switch_document"}
 
@@ -233,8 +233,24 @@ def add_paint_layer(doc, name, above):
 
 
 def target_layer(doc, p):
-    """The paint layer an operation draws on: new_layer (created) > layer > active layer."""
+    """The paint layer an operation draws on: new_layer (created) > layer > active layer.
+    A new layer goes right above `above` / right below `below` (layer names) if given, else above
+    the active layer."""
     if p.get("new_layer"):
+        if p.get("below"):
+            ref = find_node(doc, p["below"])
+            parent = ref.parentNode()
+            sibs = parent.childNodes()                       # bottom first
+            i = next(j for j, s in enumerate(sibs) if s.uniqueId() == ref.uniqueId())
+            if i > 0:
+                return add_paint_layer(doc, p["new_layer"], sibs[i - 1])
+            n = add_paint_layer(doc, p["new_layer"], ref)    # then move it under ref
+            kids = [k for k in parent.childNodes() if k.uniqueId() != n.uniqueId()]
+            parent.setChildNodes([n] + kids)
+            settle(doc)
+            return find_node(doc, n.uniqueId().toString())
+        if p.get("above"):
+            return add_paint_layer(doc, p["new_layer"], find_node(doc, p["above"]))
         return add_paint_layer(doc, p["new_layer"], doc.activeNode())
     n = find_node(doc, p.get("layer"))
     if n.type() != "paintlayer":
@@ -453,7 +469,12 @@ def paint_line(node, a, b):
 class Commands:
     # --- general ---------------------------------------------------------------
     def ping(self, p):
-        return {"pong": True, "krita": app().version(), "bridge": VERSION}
+        out = {"pong": True, "krita": app().version(), "bridge": VERSION, "windows": len(app().windows())}
+        dialogs = [w.windowTitle() for w in QApplication.topLevelWidgets()
+                   if w.isVisible() and w.isModal()]
+        if dialogs:
+            out["dialogs"] = dialogs          # e.g. Krita's "Recover Files" at startup
+        return out
 
     def status(self, p):
         a = app()
@@ -657,6 +678,37 @@ class Commands:
         out["document_size"] = [d.width(), d.height()]
         return out
 
+    def get_image(self, p):
+        """Full-resolution PNG (with alpha) of the canvas or one layer, for server-side processing."""
+        d = doc_required(p)
+        finish(d)
+        x, y, w, h = [int(v) for v in (p.get("rect") or [0, 0, d.width(), d.height()])]
+        if p.get("layer"):
+            n = find_node(d, p["layer"])
+            img = raster.image_from_bytes(n.projectionPixelData(x, y, w, h), w, h)
+        else:
+            img = d.projection(x, y, w, h)
+        out = png_b64(img, None)
+        out["rect"] = [x, y, w, h]
+        return out
+
+    def put_image(self, p):
+        """Composite a PNG onto a paint layer (undoable): x, y, mode, opacity, clip, blur, selection."""
+        d = doc_required(p)
+        n = target_layer(d, p)
+        img = QImage.fromData(QByteArray(base64.b64decode(p["png_base64"])), "PNG")
+        if img.isNull():
+            raise McpError("Could not decode the image.")
+        if p.get("replace"):        # clear the area first, so the image replaces what was there
+            clear = raster.new_image(img.width(), img.height())
+            clear.fill(QColor(0, 0, 0))
+            n = commit(d, n, clear, int(p.get("x", 0)), int(p.get("y", 0)), mode="erase",
+                       use_selection=p.get("use_selection", True))
+        n = commit(d, n, img, int(p.get("x", 0)), int(p.get("y", 0)), mode=p.get("mode", "normal"),
+                   opacity=p.get("opacity", 1.0), clip=p.get("clip", False), blur=p.get("blur", 0),
+                   use_selection=p.get("use_selection", True))
+        return {"layer": n.name(), "rect": [int(p.get("x", 0)), int(p.get("y", 0)), img.width(), img.height()]}
+
     # --- layers ----------------------------------------------------------------
     def list_layers(self, p):
         d = doc_required(p)
@@ -735,6 +787,7 @@ class Commands:
         d = doc_required(p)
         n = find_node(d, p["layer"])
         d.setActiveNode(n)
+        settle(d)             # Krita switches the active layer asynchronously
         return {"active": n.name()}
 
     def delete_layer(self, p):
