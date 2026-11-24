@@ -41,7 +41,7 @@ Line-art drawing is built into `draw_strokes`, so it works on the first try:
 - **`fill_line_art(debug_view=true)`** shows every enclosed area in its own color, with the seeds marked, if something still leaks.
 - **`edge_light`** adds rim or kicker light only on the edges that face the light.
 
-The heavy image work (numpy, SciPy, Pillow) runs in the MCP server, so the Krita plugin stays lightweight. `uv` installs these the first time the server starts.
+The heavy image work (numpy, SciPy, Pillow) runs in the MCP server, so the Krita plugin stays lightweight. The installer sets these up for you.
 
 ## Posed figures (v0.4)
 
@@ -89,43 +89,65 @@ Claude ──MCP (stdio)──> server.py ──JSON over 127.0.0.1:9877──> 
 ```
 
 - **`plugin/krita_mcp`** is a Krita Python plugin. It opens a small socket server inside Krita, on this computer only (`127.0.0.1`). Commands run on Krita's main thread, so they use Krita's own brush engine, layers and undo history.
-- **`server.py`** is the MCP server. It turns tool calls into commands for the plugin. It runs with [uv](https://docs.astral.sh/uv/) and needs no other setup.
+- **`server.py`** is the MCP server. It turns tool calls into commands for the plugin. It's plain Python; the installer sets it up in its own environment.
 
 ## Install
 
-Requires **Krita 5.2 or newer** (tested on 5.3.4) and **uv**.
+Works on **Windows, macOS and Linux**. You need **Krita 5.2 or newer** (tested on 5.3.4) and **Python 3.10 or newer**. Nothing else: no uv, no manual pip.
 
-### 1. Install the Krita plugin
+Close Krita, then run the installer from this folder:
 
-**Windows:** close Krita, then run:
+| OS | Command |
+|---|---|
+| Windows | double-click `install.cmd`, or run `python install.py` |
+| macOS | `python3 install.py` |
+| Linux | `python3 install.py` (Flatpak Krita is detected automatically; `--flatpak` forces it) |
 
-```powershell
-powershell -ExecutionPolicy Bypass -File install.ps1
-```
+It does everything in one go:
 
-This copies the plugin to `%APPDATA%\krita\pykrita` and enables it in Krita's settings.
+1. copies the plugin into Krita's `pykrita` folder;
+2. turns it on in Krita's settings (the old settings file is kept as `kritarc.before-krita-mcp`);
+3. creates a private Python environment in `.venv` here and installs the server's packages into it (`mcp`, `numpy`, `scipy`, `pillow`). Nothing is installed system-wide;
+4. registers the server with Claude Code if the `claude` command exists, and prints the config snippet for Claude Desktop or any other MCP client.
 
-**Manually (any OS):** copy `plugin/krita_mcp/` and `plugin/kritapykrita_krita_mcp.desktop` into Krita's `pykrita` folder (*Settings › Manage Resources › Open Resource Folder*, then `pykrita`). Restart Krita, enable **Krita MCP (Claude)** in *Settings › Configure Krita › Python Plugin Manager*, and restart Krita again.
+Then start Krita and restart Claude. To check the plugin is running, use *Tools › Scripts › Krita MCP (Claude): status* in Krita.
 
-To check it's running, use *Tools › Scripts › Krita MCP (Claude): status*.
+Options: `--plugin-only` (just the plugin, if you run the server yourself), `--no-register` (don't touch Claude Code's config), `--dry-run` (show what would happen).
 
-### 2. Add the MCP server to your client
+<details>
+<summary>Where things go, and manual install</summary>
 
-Claude Code:
+| OS | Plugin folder (`pykrita`) | Krita settings (`kritarc`) |
+|---|---|---|
+| Windows | `%APPDATA%\krita\pykrita` | `%LOCALAPPDATA%\kritarc` |
+| macOS | `~/Library/Application Support/krita/pykrita` | `~/Library/Preferences/kritarc` |
+| Linux | `~/.local/share/krita/pykrita` | `~/.config/kritarc` |
+| Linux (Flatpak) | `~/.var/app/org.kde.krita/data/krita/pykrita` | `~/.var/app/org.kde.krita/config/kritarc` |
+
+By hand: copy `plugin/krita_mcp/` and `plugin/kritapykrita_krita_mcp.desktop` into the plugin folder, start Krita, enable **Krita MCP (Claude)** in *Settings › Configure Krita › Python Plugin Manager*, and restart Krita. Then run the server any of these ways:
 
 ```bash
-claude mcp add krita -s user -- uv run --quiet /path/to/krita-mcp/server.py
+pip install -r requirements.txt && python server.py      # plain Python
+uv run server.py                                         # uv reads the dependencies from server.py itself
 ```
+
+Claude Code: `claude mcp add krita -s user -- python /path/to/krita-mcp/server.py`
 
 Claude Desktop (`claude_desktop_config.json`):
 
 ```json
 {
   "mcpServers": {
-    "krita": { "command": "uv", "args": ["run", "--quiet", "/path/to/krita-mcp/server.py"] }
+    "krita": { "command": "/path/to/krita-mcp/.venv/bin/python", "args": ["/path/to/krita-mcp/server.py"] }
   }
 }
 ```
+
+On Windows the Python inside the environment is `.venv\Scripts\python.exe`.
+
+</details>
+
+`launch_krita` finds Krita in its usual places: Program Files on Windows, `/Applications` or `~/Applications` on macOS, and on Linux the `krita` command, Flatpak, Snap, or an AppImage in `~/Applications`, `~/Downloads`, `~/bin` or `~/.local/bin`. Anywhere else, set `KRITA_PATH`.
 
 Optional environment variables:
 

@@ -8,12 +8,13 @@ Krita MCP - lets Claude (or any MCP client) draw in Krita.
 Krita runs a small bridge plugin (plugin/krita_mcp) that listens on 127.0.0.1:9877.
 This server turns MCP tool calls into commands for that bridge.
 
-Run it with:
-    uv run path/to/server.py
+Install everything with `python install.py` (any OS). Or run it directly with:
+    uv run path/to/server.py                (uv reads the dependencies above)
+    python server.py                        (after: pip install -r requirements.txt)
 
 Environment:
     KRITA_MCP_PORT   port of the bridge inside Krita (default 9877)
-    KRITA_PATH       krita.exe / krita binary, used by launch_krita (found automatically otherwise)
+    KRITA_PATH       the Krita program (krita.exe, the macOS app binary, an AppImage), used by launch_krita (found automatically otherwise)
 """
 import base64
 import itertools
@@ -90,9 +91,11 @@ def _image(result: dict) -> Image:
     return Image(data=base64.b64decode(result["png_base64"]), format="png")
 
 
-def _find_krita() -> str | None:
+def _find_krita() -> list | None:
+    """The command that starts Krita on this OS (a list, e.g. ["flatpak", "run", "org.kde.krita"])."""
     if os.environ.get("KRITA_PATH"):
-        return os.environ["KRITA_PATH"]
+        return [os.environ["KRITA_PATH"]]
+    home = os.path.expanduser("~")
     candidates = []
     if sys.platform == "win32":
         for base in (os.environ.get("ProgramFiles", r"C:\Program Files"), os.environ.get("ProgramFiles(x86)", "")):
@@ -100,11 +103,26 @@ def _find_krita() -> str | None:
                 candidates.append(os.path.join(base, "Krita (x64)", "bin", "krita.exe"))
                 candidates.append(os.path.join(base, "Krita", "bin", "krita.exe"))
     elif sys.platform == "darwin":
-        candidates.append("/Applications/krita.app/Contents/MacOS/krita")
+        candidates += ["/Applications/krita.app/Contents/MacOS/krita",
+                       os.path.join(home, "Applications", "krita.app", "Contents", "MacOS", "krita")]
     for c in candidates:
         if os.path.exists(c):
-            return c
-    return shutil.which("krita")
+            return [c]
+    found = shutil.which("krita")
+    if found:
+        return [found]
+    if sys.platform.startswith("linux"):
+        if shutil.which("flatpak") and os.path.isdir(os.path.join(home, ".var", "app", "org.kde.krita")):
+            return ["flatpak", "run", "org.kde.krita"]
+        if os.path.exists("/snap/bin/krita"):
+            return ["/snap/bin/krita"]
+        import glob
+        for d in ("Applications", "Downloads", "bin", ".local/bin", "Desktop"):
+            imgs = sorted(glob.glob(os.path.join(home, d, "krita*.appimage")) +
+                          glob.glob(os.path.join(home, d, "krita*.AppImage")))
+            if imgs:
+                return [imgs[-1]]
+    return None
 
 
 # ----------------------------------------------------------------------------- general
@@ -122,12 +140,17 @@ def launch_krita(wait_seconds: int = 90) -> dict:
         return {"already_running": True, **call("ping")}
     except KritaNotRunning:
         pass
-    exe = _find_krita()
-    if not exe:
-        raise RuntimeError("Couldn't find Krita. Set KRITA_PATH to krita.exe.")
-    flags = getattr(subprocess, "DETACHED_PROCESS", 0) | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
-    subprocess.Popen([exe], creationflags=flags, close_fds=True,
-                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    cmd = _find_krita()
+    if not cmd:
+        raise RuntimeError("Couldn't find Krita. Set the KRITA_PATH environment variable to the Krita "
+                           "program (krita.exe, krita.app/Contents/MacOS/krita, or the AppImage).")
+    if sys.platform == "win32":
+        flags = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
+        subprocess.Popen(cmd, creationflags=flags, close_fds=True,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    else:                                   # detach so Krita outlives the MCP server
+        subprocess.Popen(cmd, start_new_session=True, close_fds=True, stdin=subprocess.DEVNULL,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     end = time.time() + wait_seconds
     last = None
     while time.time() < end:
