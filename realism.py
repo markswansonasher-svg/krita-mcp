@@ -442,16 +442,21 @@ def painterly(img, sizes=(24, 12, 6, 3), threshold=0.06, max_length=10, curvatur
 
 # ----------------------------------------------------------------------------- line-art coloring
 
-def fill_line_art(lines, seeds, background_seeds=(), gap=2, default_color=None, line_threshold=0.3):
+def fill_line_art(lines, seeds, background_seeds=(), gap=2, default_color=None, line_threshold=0.3,
+                  polygons=(), coverage=0.6):
     """Flat colors for drawn line art (like a bucket fill / colorize mask).
     lines: RGBA of the line layer. seeds: [(x, y, color)] - each fills the enclosed area it is in.
     Areas touching the top/left/right canvas edge, or containing a background seed, stay empty.
     gap: line gaps up to about 2*gap px are treated as closed. Unseeded enclosed areas get
     default_color (if given). Color is grown under the lines, so no white halos.
+    polygons: [(points, color)] in drawing order - every enclosed area lying mostly (>= coverage)
+    inside a polygon takes its color; later polygons (drawn in front) win. Explicit seeds override.
     Returns RGBA (H x W x 4)."""
     H, W = lines.shape[:2]
     ink = lines[..., 3] > line_threshold
-    closed = ndimage.binary_dilation(ink, iterations=max(0, int(gap))) if gap > 0 else ink
+    # morphological closing bridges gaps up to ~2*gap px without making the lines thicker,
+    # so thin areas between close lines (bands, stripes) survive
+    closed = (ndimage.binary_closing(ink, iterations=int(gap)) | ink) if gap > 0 else ink
     labels, n = ndimage.label(~closed)
     bg = set(np.unique(np.concatenate([labels[0, :], labels[:, 0], labels[:, -1]])).tolist())
     bg.discard(0)
@@ -472,6 +477,16 @@ def fill_line_art(lines, seeds, background_seeds=(), gap=2, default_color=None, 
             bg.add(lb)
     color_of = {}
     leaked = []
+    if polygons:
+        sizes = np.bincount(labels.ravel(), minlength=n + 1).astype(np.float64)
+        for pts, c in polygons:
+            im = Image.new("L", (W, H), 0)
+            ImageDraw.Draw(im).polygon([(float(x), float(y)) for x, y in pts], fill=1)
+            m = np.asarray(im, np.float64)
+            cover = np.bincount(labels.ravel(), weights=m.ravel(), minlength=n + 1) / np.maximum(sizes, 1)
+            for lb in np.nonzero(cover >= coverage)[0]:
+                if lb and lb not in bg:
+                    color_of[int(lb)] = rgb(c)
     for i, (x, y, c) in enumerate(seeds):
         lb = label_at(x, y)
         if lb and lb not in bg:
@@ -481,6 +496,15 @@ def fill_line_art(lines, seeds, background_seeds=(), gap=2, default_color=None, 
         else:
             leaked.append({"seed": i, "at": [round(x), round(y)], "problem": "area is open to the background"})
     fill_line_art.last_report = leaked
+    # debug view: every enclosed area in its own random color, background grey, lines black
+    rng = np.random.default_rng(5)
+    pal = rng.uniform(0.25, 1.0, (n + 1, 3)).astype(np.float32)
+    pal[0] = 0
+    for b_ in bg:
+        pal[b_] = 0.85
+    dbg = pal[labels]
+    dbg[closed] = 0.0
+    fill_line_art.last_debug = (dbg, [(x, y) for x, y, _ in seeds])
     out = np.zeros((H, W, 4), np.float32)
     filled = np.zeros((H, W), bool)
     if default_color is not None:
@@ -510,6 +534,41 @@ def fill_line_art(lines, seeds, background_seeds=(), gap=2, default_color=None, 
     out[..., 3] = np.maximum(out[..., 3], (ink & ~background & ndimage.binary_dilation(filled, iterations=3 + int(gap))))
     out[..., 3] = gblur(out[..., 3], 0.6) * (out[..., 3] > 0)
     return out
+
+
+# ----------------------------------------------------------------------------- edge light
+
+def edge_light(img, angle=60.0, width=6.0, power=1.5, by_color=False, color_tolerance=0.06, inner=0.0):
+    """Light on the edges of a shape that FACE a light coming from `angle` (0 = right, 90 = top).
+    Returns a 0..1 intensity map: brightest right at the edge, fading inward over `width` px.
+    by_color: also light the edges between differently colored regions (plate edges), scaled by
+    `inner` (0..1)."""
+    alpha = img[..., 3]
+    inside = alpha > 0.5
+    a = math.radians(angle)
+    lx, ly = math.cos(a), -math.sin(a)
+
+    def rim_of(mask, scale):
+        # for every pixel inside: distance and direction to the nearest edge (outward normal)
+        d, (oy, ox) = ndimage.distance_transform_edt(mask, return_indices=True)
+        fy = oy - np.arange(mask.shape[0])[:, None]
+        fx = ox - np.arange(mask.shape[1])[None, :]
+        fn = np.hypot(fx, fy) + 1e-6
+        facing = np.clip((fx / fn) * lx + (fy / fn) * ly, 0, 1) ** power
+        facing = gblur(facing.astype(np.float32), 1.5)          # smooth direction changes at corners
+        band = np.exp(-np.maximum(d - 0.5, 0) / max(width, 0.5)) * mask
+        return band * facing * scale
+
+    out = rim_of(inside, 1.0)
+    if by_color and inner > 0:
+        q = np.round(img[..., :3] / max(color_tolerance, 1e-3)).astype(np.int64)
+        key = (q[..., 0] * 73856093) ^ (q[..., 1] * 19349663) ^ (q[..., 2] * 83492791)
+        key = np.where(inside, key, -1)
+        seam = np.zeros_like(inside)
+        seam[:, 1:] |= key[:, 1:] != key[:, :-1]
+        seam[1:, :] |= key[1:, :] != key[:-1, :]
+        out = np.maximum(out, rim_of(inside & ~seam, inner))
+    return np.clip(out, 0, 1).astype(np.float32)
 
 
 # ----------------------------------------------------------------------------- shadows
@@ -629,8 +688,135 @@ def expand_shapes(shapes):
 
 # ----------------------------------------------------------------------------- natural strokes
 
+def fillet(points, radius, samples=6):
+    """Round the corners of a closed polygon (hard-surface parts with softened corners)."""
+    pts = [list(map(float, p[:2])) for p in points]
+    if len(pts) > 2 and pts[0] == pts[-1]:
+        pts = pts[:-1]
+    n = len(pts)
+    out = []
+    for i in range(n):
+        p0, p1, p2 = pts[i - 1], pts[i], pts[(i + 1) % n]
+        a = [p0[0] - p1[0], p0[1] - p1[1]]
+        b = [p2[0] - p1[0], p2[1] - p1[1]]
+        la, lb = math.hypot(*a) or 1, math.hypot(*b) or 1
+        d = min(radius, la * 0.45, lb * 0.45)
+        s0 = [p1[0] + a[0] / la * d, p1[1] + a[1] / la * d]
+        s1 = [p1[0] + b[0] / lb * d, p1[1] + b[1] / lb * d]
+        for k in range(samples + 1):
+            t = k / samples
+            out.append([round((1 - t) ** 2 * s0[0] + 2 * (1 - t) * t * p1[0] + t * t * s1[0], 2),
+                         round((1 - t) ** 2 * s0[1] + 2 * (1 - t) * t * p1[1] + t * t * s1[1], 2)])
+    return out
+
+
+def outline_points(shape):
+    """Closed outline points (screen px) for a shape dict - the same shapes `paint` understands,
+    plus corner_radius for polygon/rect. Used to DRAW a shape as an ink contour."""
+    t = shape.get("type", "polygon")
+    cr = float(shape.get("corner_radius", 0))
+    if t == "tube":
+        return tube_outline(shape["spine"], shape.get("caps", True))
+    if t == "blob":
+        return blob_outline(shape["cx"], shape["cy"], shape.get("rx", shape.get("r", 50)),
+                            shape.get("ry", shape.get("r", 50)), shape.get("rotation", 0),
+                            shape.get("wobble", 0.15), shape.get("lumps", 5), shape.get("seed", 1))
+    if t in ("ellipse", "circle"):
+        if t == "circle":
+            cx, cy, rx, ry = shape["cx"], shape["cy"], shape["r"], shape["r"]
+        else:
+            cx, cy = shape["x"] + shape["w"] / 2, shape["y"] + shape["h"] / 2
+            rx, ry = shape["w"] / 2, shape["h"] / 2
+        rot = math.radians(shape.get("rotation", 0))
+        pts = []
+        for i in range(72):
+            a = 2 * math.pi * i / 72
+            x, y = math.cos(a) * rx, math.sin(a) * ry
+            pts.append([round(cx + x * math.cos(rot) - y * math.sin(rot), 2),
+                        round(cy + x * math.sin(rot) + y * math.cos(rot), 2)])
+        return pts
+    if t in ("rect", "rectangle"):
+        x, y, w, h = shape["x"], shape["y"], shape["w"], shape["h"]
+        pts = [[x, y], [x + w, y], [x + w, y + h], [x, y + h]]
+        return fillet(pts, cr) if cr else pts
+    if t == "path":
+        pts = [tuple(map(float, p[:2])) for p in shape["points"]]
+        dense = _catmull(pts + [pts[0]], 10) if shape.get("smooth", True) else pts
+        return [[round(p[0], 2), round(p[1], 2)] for p in dense]
+    pts = [list(map(float, p[:2])) for p in shape["points"]]
+    return fillet(pts, cr) if cr else pts
+
+
+def interior_point(points):
+    """A point deep inside a closed outline (pole of inaccessibility on a raster) - a robust fill seed."""
+    xs, ys = [p[0] for p in points], [p[1] for p in points]
+    x0, y0 = min(xs) - 2, min(ys) - 2
+    w, h = int(max(xs) - x0) + 4, int(max(ys) - y0) + 4
+    sc = min(1.0, 400.0 / max(w, h, 1))
+    im = Image.new("L", (max(2, int(w * sc)), max(2, int(h * sc))), 0)
+    ImageDraw.Draw(im).polygon([((x - x0) * sc, (y - y0) * sc) for x, y in points], fill=255)
+    m = np.asarray(im) > 0
+    if not m.any():
+        return [sum(xs) / len(xs), sum(ys) / len(ys)]
+    d = ndimage.distance_transform_edt(m)
+    iy, ix = np.unravel_index(np.argmax(d), d.shape)
+    return [x0 + ix / sc, y0 + iy / sc]
+
+
+def snap_endpoints(strokes, others, radius_k=1.6, min_radius=6.0):
+    """For strokes marked joins (and not closed): move each end onto the nearest point of another
+    line (in this batch or already on the layer) within reach, nudged slightly into it, so line art
+    closes for coloring. Returns the number of ends snapped."""
+    segs = []
+    owner = []
+    for idx, st in enumerate(strokes):
+        pts = st["points"]
+        for a, b in zip(pts, pts[1:]):
+            segs.append((a[0], a[1], b[0], b[1]))
+            owner.append(idx)
+    for pts in others:
+        for a, b in zip(pts, pts[1:]):
+            segs.append((a[0], a[1], b[0], b[1]))
+            owner.append(-1)
+    if not segs:
+        return 0
+    S = np.array(segs, np.float64)
+    O = np.array(owner)
+    ax, ay, bx, by = S[:, 0], S[:, 1], S[:, 2], S[:, 3]
+    dx, dy = bx - ax, by - ay
+    L2 = np.maximum(dx * dx + dy * dy, 1e-9)
+    snapped = 0
+    for idx, st in enumerate(strokes):
+        if not st.get("joins") or st.get("closed") or len(st["points"]) < 2:
+            continue
+        size = float(st.get("size") or 4)
+        r = max(min_radius, radius_k * size + 3)
+        for end in (0, -1):
+            p = st["points"][end]
+            nb = st["points"][1 if end == 0 else -2]
+            t = np.clip(((p[0] - ax) * dx + (p[1] - ay) * dy) / L2, 0, 1)
+            qx, qy = ax + t * dx, ay + t * dy
+            d = np.hypot(qx - p[0], qy - p[1])
+            # ignore this stroke's own segments near this end
+            own = O == idx
+            d = np.where(own, np.inf, d)
+            k = int(np.argmin(d))
+            if d[k] <= r and d[k] > 0.3:
+                ux, uy = qx[k] - p[0], qy[k] - p[1]
+                ln = math.hypot(ux, uy) or 1
+                push = size * 0.3
+                newp = [round(qx[k] + ux / ln * push, 2), round(qy[k] + uy / ln * push, 2)] + list(p[2:])
+                st["points"][end] = newp
+                snapped += 1
+            elif d[k] > r:
+                pass
+    return snapped
+
+
 def naturalize(stroke, size, amount=0.5, seed=1):
     """Make a stroke feel hand-drawn: gentle wobble, pressure that swells and lifts, slight overshoot."""
+    if stroke.get("joins"):
+        stroke = dict(stroke, overshoot=False)
     pts = [list(map(float, p)) + ([1.0] if len(p) < 3 else []) for p in stroke["points"]]
     has_pressure = any(len(p) > 2 for p in stroke["points"])
     if len(pts) < 2 or amount <= 0:
@@ -651,8 +837,10 @@ def naturalize(stroke, size, amount=0.5, seed=1):
         res.append([a[k] + (b[k] - a[k]) * f for k in range(3)])
     wob = noise1d(len(res), max(2, total / 120), seed)
     amp = amount * min(0.012 * total + 0.25 * size, 6 + size)
-    if stroke.get("closed"):          # a closed outline must end where it starts
-        wob = [w * math.sin(math.pi * i / max(1, len(wob) - 1)) for i, w in enumerate(wob)]
+    if stroke.get("closed") or stroke.get("joins"):
+        # closed outlines must end where they start; joined lines must end exactly where they meet
+        n_ = max(1, len(wob) - 1)
+        wob = [w * min(1.0, 5 * i / n_, 5 * (n_ - i) / n_) for i, w in enumerate(wob)]
     out = []
     for i, (x, y, p) in enumerate(res):
         a = res[max(i - 1, 0)]

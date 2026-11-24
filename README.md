@@ -26,11 +26,20 @@ The soldier scene again, with `render_form` on the hallway and armor, texture, a
 
 ![The sci-fi soldier with computed lighting, metal reflections and a painterly finish](docs/scifi-soldier-real.png)
 
-The same soldier **drawn line by line** instead of built from shapes ([`examples/scifi_soldier_drawn.py`](examples/scifi_soldier_drawn.py)). Every edge is a hand-drawn ink stroke with curved contours, a line-weight hierarchy, natural wobble and tapered detail lines. Lines hidden behind the rifle and arms are erased, as an inker would. The drawing is then colored between the lines with **`fill_line_art`** (like a bucket fill or Krita's colorize mask) and lit with `render_form`:
+The same soldier **drawn as line art** ([`examples/scifi_soldier_drawn.py`](examples/scifi_soldier_drawn.py)), produced on the first run:
 
 ![The soldier drawn as line art, colored and lit](docs/scifi-soldier-drawn.png)
 
-`fill_line_art` reports any seed whose area leaks to the background or shares an area with another seed, so gaps in the lines are easy to find and close.
+Line-art drawing is built into `draw_strokes`, so it works on the first try:
+
+![Line-art tools: a limb drawn as a tube outline, a plate in front occluding it, a seam that snaps shut, all colored automatically](docs/lineart-tools.png)
+
+- **`"outline"`**: a stroke can be a shape's contour. A `tube` (a spine with a radius at each point) gives limbs and fingers natural tapering contours; `blob`, rounded-corner polygons and smooth paths cover the rest.
+- **`"fill"`**: an outline carries its color. `fill_line_art` then colors every enclosed area that lies mostly inside it, even when seams or parts in front split it into pieces. No seed coordinates needed.
+- **`"occlude"`**: a part in front erases the lines behind it exactly up to its own contour. No hand-sized erasers, so no stubs or gaps.
+- **`"joins"`**: seams and panel lines get solid ends that snap onto the contour they meet, so areas close for coloring.
+- **`fill_line_art(debug_view=true)`** shows every enclosed area in its own color, with the seeds marked, if something still leaks.
+- **`edge_light`** adds rim or kicker light only on the edges that face the light.
 
 The heavy image work (numpy, SciPy, Pillow) runs in the MCP server, so the Krita plugin stays lightweight. `uv` installs these the first time the server starts.
 
@@ -105,11 +114,11 @@ Optional environment variables:
 | Documents | `new_document`, `open_document`, `list_documents`, `switch_document`, `resize_canvas`, `scale_image`, `save` (.kra/.psd/.ora), `export_image` (.png/.jpg/.webp…, resize, crop, single layer), `close_document` |
 | Layers | `list_layers`, `add_layer`, `set_layer` (rename, opacity, blend mode, visibility, lock, alpha lock, `clipped` for clipping-mask style layers, reorder), `select_layer`, `delete_layer`, `duplicate_layer`, `merge_down`, `flatten`, `clear_layer`, `fill_layer`, `place_image` |
 | Brushes | `list_brushes`, `set_brush` (preset, size, color, opacity, flow, blend, eraser), `get_brush` |
-| Painting | `draw_strokes` (engines: `brush` = Krita presets with pressure; `ink`, `pencil`, `charcoal`, `marker` = clean variable-width strokes with tapers and grain; each stroke has one opacity, so segments don't overlap darker), `draw_shapes` (brush-outlined shapes), `set_pixels`, `get_pixels` |
+| Painting | `draw_strokes` (line-art keys `outline`, `fill`, `occlude`, `joins`; engines: `brush` = Krita presets with pressure; `ink`, `pencil`, `charcoal`, `marker` = clean variable-width strokes with tapers and grain; each stroke has one opacity, so segments don't overlap darker), `draw_shapes` (brush-outlined shapes), `set_pixels`, `get_pixels` |
 | Rendering | `paint` (antialiased shapes with flat colors or linear, radial or conical gradients, per-shape erase), `paint_svg` (SVG with gradients straight onto a layer), `add_svg` (editable vector layer). All take `mode` (blend mode), `clip` (only where paint exists), `blur` (soft edges, glows) and `new_layer`. |
 | Procedural | `scatter_strokes` (grass, fur, scratches, sparks, dust), `hatch` (hatching and cross-hatching in any polygon) |
 | Selection & masks | `select` (rect, ellipse, circle, polygon, smooth path, shapes, SVG, a layer's paint, invert; add, subtract or intersect; feather, grow, shrink), `add_mask` (transparency mask) |
-| Realism | `fill_line_art` (color drawn line art between its lines), `render_form` (lit 3D forms from flat shapes, with materials), `texture`, `cast_shadow`, `painterly`; `tube` and `blob` shapes; `natural` and `passes` for strokes |
+| Realism | `fill_line_art` (color drawn line art between its lines), `edge_light` (rim light on light-facing edges), `render_form` (lit 3D forms from flat shapes, with materials), `texture`, `cast_shadow`, `painterly`; `tube` and `blob` shapes; `natural` and `passes` for strokes |
 | Other | `art_guide` (workflow advice for complex pictures), `list_filters`, `filter_settings`, `apply_filter`, `run_action`, `list_actions`, `undo` (a whole call), `redo`, `execute_python` |
 
 Coordinates are document pixels with the origin at the top left. Stroke points can be `[x, y]` or `[x, y, pressure]`:

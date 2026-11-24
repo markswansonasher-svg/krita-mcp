@@ -161,6 +161,8 @@ def new_document(width: int = 1920, height: int = 1080, name: str = "Untitled",
     """Create a document and open it in Krita. background: a color, or "transparent".
     It gets a 'Background' layer plus an empty 'Paint' layer (active) to draw on.
     For pixel art use a small size (e.g. 32x32) and set_pixels."""
+    for key in [k_ for k_ in _LINE_ART if k_[0] in ("", name)]:
+        _LINE_ART.pop(key, None)
     return call("new_document", width=width, height=height, name=name, background=background,
                 resolution=resolution, color_model=color_model, color_depth=color_depth)
 
@@ -334,18 +336,21 @@ def get_brush(document: str | None = None) -> dict:
 
 # ----------------------------------------------------------------------------- painting
 
+_LINE_ART = {}   # (document, layer) -> {"lines": [polylines], "seeds": [(x, y, color)]} for fill_line_art
+
+
+def _art_key(document, layer):
+    return (document or "", layer or "")
+
+
 @mcp.tool()
 def draw_strokes(strokes: list[dict], engine: str = "brush", layer: str | None = None,
                  new_layer: str | None = None, preset: str | None = None, size: float | None = None,
                  color: str | dict | None = None, opacity: float | None = None, mode: str = "normal",
                  clip: bool = False, blur: float = 0, taper: float | None = None, grain: float | None = None,
-                 smooth: bool = True, natural: float = 0.0, passes: int = 1, seed: int = 1,
+                 smooth: bool = True, natural: float = 0.0, passes: int = 1, seed: int = 1, snap: bool = True,
                  document: str | None = None) -> dict:
     """Paint strokes. Points are [x, y] or [x, y, pressure 0-1]. Send many strokes per call.
-
-    natural 0-1: make lines feel hand-drawn - a gentle wobble, pressure that swells and lifts (when
-    no pressure is given) and a slight overshoot at the ends. 0.3-0.6 is a good range for line art.
-    passes > 1: sketchy look - each stroke is drawn several times, slightly different, lighter.
 
     engine (per call, or "engine" per stroke):
       "brush"    Krita's brush engine with a preset (list_brushes) - textured, painterly marks.
@@ -354,10 +359,57 @@ def draw_strokes(strokes: list[dict], engine: str = "brush", layer: str | None =
     Per stroke: points, color, size, preset, opacity, flow, eraser, smooth (curve through points),
       closed, and for ink engines: taper (0-0.5 of the length auto-tapered at each end, or [start, end]),
       grain 0-1, min_width. Ink color may be a gradient dict (see `paint`).
+
+    LINE ART (draw an object line by line, then color it with fill_line_art):
+      "outline": a shape dict (as in `paint`: tube {spine [[x,y,r],...]} for limbs/fingers/tentacles,
+          blob, ellipse, circle, rect/polygon with "corner_radius", smooth "path") - the stroke becomes
+          that shape's closed contour line. Instead of "points".
+      "fill": color - remembers this closed outline's color; fill_line_art then colors its inside
+          without any seeds (later strokes win where outlines overlap: draw back to front).
+      "occlude": true - this outline is IN FRONT: lines already on the layer inside it are erased
+          up to its contour before it is drawn (no hand-sized erasers, no stubs, no gaps).
+      "joins": true - a line meeting other lines at its ends (seams, panel edges, folds that end on a
+          contour): solid ends, no overshoot, and (snap=true) its ends snap onto the nearest line
+          within reach so areas close for coloring. Free-ending detail lines (creases, vents, hair)
+          leave it off and taper away. Outlines are joins automatically.
+    natural 0-1: hand-drawn wobble, pressure that swells and lifts, overshoot on free ends.
+    passes > 1: sketchy look - each stroke drawn several times, lighter.
     Each stroke has ONE opacity (overlapping segments don't darken). mode: blend mode for the
     whole call (normal, multiply, screen, overlay, add, color_dodge, soft_light, erase...).
     clip: only where the layer already has paint. blur: soften (px). new_layer: paint on a new layer.
-    Painting respects the current selection. One call = one undo step."""
+    Painting respects the current selection."""
+    target = new_layer or layer
+    if target is None:
+        st_ = call("status", document=document)
+        target = (st_.get("active_document") or {}).get("active_layer")
+    art = _LINE_ART.setdefault(_art_key(document, target), {"lines": [], "polygons": []})
+
+    prepped = []
+    for st in strokes:
+        st = dict(st)
+        if st.get("outline"):
+            st["points"] = realism.outline_points(st.pop("outline"))
+            st["closed"] = True
+            st["joins"] = True
+            st.setdefault("smooth", False)          # outline points are already dense and smooth
+        if st.get("joins"):
+            sz = float(st.get("size") or size or 6)
+            st.update(overshoot=False, taper=min(float(st.get("taper", 0.06)), 0.08))
+            st.setdefault("min_width", sz * 0.55)
+            st.setdefault("size", sz)
+        prepped.append(st)
+    if snap:
+        realism.snap_endpoints(prepped, art["lines"])
+    # remember geometry and fills for fill_line_art (in drawing order)
+    for st in prepped:
+        pts = [p[:2] for p in st["points"]]
+        if st.get("closed") and pts and pts[0] != pts[-1]:
+            pts = pts + [pts[0]]
+        if not st.get("eraser") and mode != "erase":
+            art["lines"].append(pts)
+        if st.get("fill") and st.get("closed"):
+            art["polygons"].append((pts, st["fill"]))
+    strokes = prepped
     if natural > 0 or passes > 1:
         out = []
         for i, st in enumerate(strokes):
@@ -370,9 +422,32 @@ def draw_strokes(strokes: list[dict], engine: str = "brush", layer: str | None =
                     ns = dict(ns, opacity=base_op * (0.55 if k else 0.85))
                 out.append(ns)
         strokes = out
-    return call("draw_strokes", strokes=strokes, engine=engine, layer=layer, new_layer=new_layer,
-                preset=preset, size=size, color=color, opacity=opacity, mode=mode, clip=clip, blur=blur,
-                taper=taper, grain=grain, smooth=smooth, document=document)
+
+    # split at occluders: draw what came before, erase inside the occluder, then continue
+    common = dict(engine=engine, preset=preset, size=size, color=color, opacity=opacity, mode=mode, clip=clip,
+                  blur=blur, taper=taper, grain=grain, smooth=smooth, document=document)
+    batch, result, first = [], None, True
+
+    def flush():
+        nonlocal batch, result, first
+        if batch:
+            kw = dict(common, layer=layer, new_layer=new_layer) if first else dict(common, layer=target)
+            result = call("draw_strokes", strokes=batch, **kw)
+            first = False
+            batch = []
+
+    for st in strokes:
+        if st.get("occlude"):
+            flush()
+            if first and new_layer:   # make sure the new layer exists before erasing on it
+                call("add_layer", name=new_layer, document=document)
+                first = False
+            poly = [p[:2] for p in st["points"]]
+            call("paint", layer=target, mode="erase", document=document,
+                 shapes=[{"type": "polygon", "points": poly, "fill": "#000000"}])
+        batch.append(st)
+    flush()
+    return result or {"strokes": 0}
 
 
 @mcp.tool()
@@ -737,18 +812,43 @@ def painterly(layer: str | None = None, new_layer: str | None = "Painterly", siz
 
 
 @mcp.tool()
-def fill_line_art(line_layer: str, seeds: list[list], background_seeds: list[list[float]] | None = None,
+def fill_line_art(line_layer: str, seeds: list[list] | None = None, background_seeds: list[list[float]] | None = None,
                   gap: int = 2, default_color: str | None = None, new_layer: str = "Flats",
-                  document: str | None = None) -> dict:
+                  debug_view: bool = False, document: str | None = None):
     """Color drawn line art the way artists do (bucket fill / colorize mask): every enclosed area
-    between the lines that contains a seed [x, y, color] is filled with that color. Areas open to the
+    between the lines that contains a seed [x, y, color] is filled with that color. Outlines drawn
+    with draw_strokes(..., "fill": color) on this layer color themselves automatically - every
+    enclosed area mostly inside such an outline (even when seams or parts in front split it into
+    pieces) takes its color, frontmost outline winning. Extra `seeds` override. Areas open to the
     top/left/right canvas edge (or containing a background seed [x, y]) stay empty. gap closes small
     breaks in the lines (px). default_color fills enclosed areas you didn't seed. The color extends
     under the lines so there are no halos. Result: a new layer just below the line layer - then
-    render_form it, shade with strokes, etc."""
+    render_form it, shade with strokes, etc.
+    debug_view=true: nothing is painted; returns an image with every enclosed area in its own random
+    color (background grey) and the seeds as numbered dots - leaks show as one color crossing a line
+    that should separate it."""
     lines = _get(line_layer, document)
-    out = realism.fill_line_art(lines, [tuple(s) for s in seeds],
-                                [tuple(b) for b in (background_seeds or [])], gap, default_color)
+    polys = _LINE_ART.get(_art_key(document, line_layer), {}).get("polygons", [])
+    seeds = [tuple(x) for x in (seeds or [])]
+    out = realism.fill_line_art(lines, seeds, [tuple(b) for b in (background_seeds or [])], gap, default_color,
+                                polygons=polys)
+    if debug_view:
+        from PIL import Image as PILImage, ImageDraw
+        dbg, pts = realism.fill_line_art.last_debug
+        bb = _bbox(lines[..., 3], 20) or (0, 0, dbg.shape[1], dbg.shape[0])
+        im = PILImage.fromarray((dbg[bb[1]:bb[3], bb[0]:bb[2]] * 255).astype(np.uint8), "RGB")
+        dr = ImageDraw.Draw(im)
+        for i, (x, y) in enumerate(pts):
+            x, y = x - bb[0], y - bb[1]
+            dr.ellipse([x - 4, y - 4, x + 4, y + 4], fill=(255, 0, 0), outline=(255, 255, 255))
+            dr.text((x + 5, y - 6), str(i), fill=(255, 255, 255))
+        scale = min(1.0, 1100 / max(im.size))
+        if scale < 1:
+            im = im.resize((int(im.size[0] * scale), int(im.size[1] * scale)))
+        import io as _io
+        buf = _io.BytesIO()
+        im.save(buf, "PNG")
+        return Image(data=buf.getvalue(), format="png")
     bb = _bbox(out[..., 3], 1)
     if bb is None:
         return {"error": "No enclosed area was filled - check that the seeds are inside closed lines."}
@@ -758,6 +858,28 @@ def fill_line_art(line_layer: str, seeds: list[list], background_seeds: list[lis
     problems = getattr(realism.fill_line_art, "last_report", [])
     if problems:
         r["seed_problems"] = problems   # leaks: close the line gap near there, or raise gap
+    return r
+
+
+@mcp.tool()
+def edge_light(layer: str, angle: float = 60, color: str = "#bff4ff", width: float = 6, power: float = 1.5,
+               opacity: float = 0.9, mode: str = "add", by_color: bool = False, inner: float = 0.5,
+               new_layer: str | None = None, document: str | None = None) -> dict:
+    """Rim / edge light: brightens only the edges of the layer's paint that FACE a light coming from
+    `angle` (degrees: 0 = right, 90 = top, 180 = left), fading inward over `width` px. Use it for
+    backlight from a corridor, sky or window (cool), and a second call for a warm kicker. by_color
+    also catches the edges between differently colored parts (plate edges) at `inner` strength.
+    Goes on a new layer above (blend `mode`, default add)."""
+    img = _get(layer, document)
+    bb = _bbox(img[..., 3], 2)
+    if bb is None:
+        return {"error": f"Layer {layer!r} is empty."}
+    x0, y0, x1, y1 = bb
+    m = realism.edge_light(img[y0:y1, x0:x1], angle, width, power, by_color, inner=inner)
+    out = realism.colorize(np.zeros(m.shape, np.float32), color, color, alpha=m)
+    name = new_layer or f"{layer} edge light"
+    r = _put(out, x0, y0, new_layer=name, above=layer, opacity=opacity, use_selection=False, document=document)
+    call("set_layer", layer=name, blend_mode=mode, document=document)
     return r
 
 
@@ -848,6 +970,20 @@ HOW TO MAKE A STRONG PICTURE WITH THESE TOOLS
 
    NATURAL LINES: draw_strokes(..., natural=0.3-0.6) gives hand-drawn wobble, pressure and overshoot;
    passes=2-3 gives a sketchy look. Prefer few long confident strokes over many short ones.
+
+2c. DRAWING A FIGURE OR OBJECT AS LINE ART (gets it right the first time):
+   - Draw back to front on one line layer. Each part is ONE stroke with "outline": a shape - tube
+     (spine with a radius per point) for limbs, fingers, cables; blob for pads, rocks, muscles;
+     polygon/rect with corner_radius for hard surface; smooth path for curved shells.
+   - Give each outline "fill": color, and "occlude": true when it is in front of what you drew
+     before - it erases the hidden lines exactly up to its contour. No erasers to size by hand.
+   - Seams, panel lines and folds that end on a contour: "joins": true (their ends snap shut).
+     Free-ending details (vents, creases, hair): plain strokes that taper.
+   - fill_line_art(line_layer) then colors everything from the outlines - no seed coordinates.
+     If it reports seed_problems, call it with debug_view=true and look.
+   - Attach things in the frame of what they touch: a hand on a grip is drawn in the grip's own
+     coordinates, so it can't end up beside it.
+   - Then render_form on the flats, edge_light for rim/kicker light, keep the lines on top.
 
 3. Light and form by hand (for stylized work, or on top of render_form), each its own pass:
    - form shadow: paint(mode="multiply", clip=true, blur=6-20) with a cool dark on the side away
