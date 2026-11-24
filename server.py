@@ -32,6 +32,8 @@ from mcp.server.fastmcp import FastMCP, Image
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import numpy as np  # noqa: E402
 import realism  # noqa: E402  (numpy/scipy/Pillow work happens here, in the server)
+import figure as fig  # noqa: E402
+import depth as dpt  # noqa: E402
 
 PORT = int(os.environ.get("KRITA_MCP_PORT", "9877"))
 HOST = "127.0.0.1"
@@ -943,6 +945,308 @@ def texture(layer: str, kind: str = "grime", scale: float = 32, dark: str = "#00
         return _put(out, x0, y0, new_layer=new_layer, above=layer, mode=mode, opacity=opacity, document=document)
     return _put(out, x0, y0, layer=layer, mode=mode, opacity=opacity, clip=clip, document=document)
 
+# ----------------------------------------------------------------------------- figures
+
+_POSE_DOC = """
+    pose (all optional): height (m, 1.85), root [x, z] floor position (m), facing (deg; 0 = facing
+      the camera, + = turned toward screen-left), crouch (m the hips drop), lean (deg forward),
+      side_bend (deg), twist (deg, chest turned vs hips), head {yaw, pitch (+ looks down), roll},
+      feet {l: [x, y, z], r: [...]} and hands {l: [...], r: [...]} in the figure's own frame relative
+      to its root (x = its left, y = up from the floor, z = its forward), metres - elbows and knees are
+      solved automatically (elbows/knees {l: pole direction, ...} to steer them).
+    camera: {eye: [x, y, z] metres (y up, z into the scene), pitch (deg up), yaw (deg), focal (px),
+      center: [cx, cy]} - use the same camera as the rest of the scene so perspective matches.
+"""
+
+
+def _camera(camera):
+    c = camera or {}
+    return fig.Camera(c.get("eye", (0, 1.6, -4)), c.get("pitch", 0), c.get("yaw", 0), c.get("focal", 1500),
+                      tuple(c.get("center", (600, 800))))
+
+
+@mcp.tool()
+def sketch_pose(pose: dict, camera: dict | None = None, layer: str | None = None, new_layer: str | None = "Pose sketch",
+                color: str = "#3fa0ff", opacity: float = 0.6, document: str | None = None) -> dict:
+    """Gesture sketch of a posed figure (stick skeleton, joints, head) to check the pose, the
+    proportions and the camera before drawing it properly - look at it, adjust the numbers, repeat,
+    then draw_figure and delete the sketch layer. Returns the joints' screen positions.""" + _POSE_DOC
+    cam = _camera(camera)
+    strokes = fig.skeleton_sketch(pose, cam)
+    draw_strokes(strokes, engine="ink", layer=layer, new_layer=new_layer, color=color, opacity=opacity,
+                 snap=False, document=document)
+    J = fig.build_skeleton(pose)
+    return {"joints": {k_: cam.project(v) for k_, v in J.items() if not k_.startswith("_")}}
+
+
+@mcp.tool()
+def draw_figure(pose: dict, camera: dict | None = None, layer: str | None = None, new_layer: str | None = "Figure lines",
+                colors: dict | None = None, attachments: list[dict] | None = None, line_sizes: list[float] | None = None,
+                line_color: str = "#0c1017", natural: float = 0.22, extra_strokes: list[dict] | None = None,
+                depth_lines: bool = True, haze_color: str = "#6f8fa0", line_style: str = "colored", seed: int = 4,
+                document: str | None = None) -> dict:
+    """Draw a posed human figure as line art: anatomical limb contours (thigh tapering to the knee,
+    calf bulge, forearm swelling below the elbow...), torso shaped to the way it faces, head, fists,
+    feet - all drawn back to front with fills and occlusion, ready for fill_line_art -> render_form.
+
+    attachments put armor, clothing and gear ON A BONE so it follows the pose:
+      {"bone": "forearm_l" | "upper_arm_r" | "thigh_l" | "shin_r" | "foot_l" | "torso" | "head" | "neck",
+       "points": [[u, v], ...]  u = along the bone (0 = start joint, 1 = end; may go past), v = across
+                 it in radius units (-1 / +1 = the limb's two contours; >1 = outside),
+       "fill": color, "smooth": true (curved) or false (+ "corner_radius" px), "thickness": 1.12 (how
+       far it stands off the limb), "size": line width, "lines": [[[u, v], ...], ...] seams on it}
+      Bones run: thigh hip->knee, shin knee->ankle, foot ankle->toe, upper_arm shoulder->elbow,
+      forearm elbow->wrist, torso pelvis->neck, head neck->head centre (helmet/visor around u ~ 1).
+    colors: {"skin" (default for limbs), "torso", "head", "hand", "leg_l"/"arm_r"..., or a bone name}.
+    line_sizes: [heavy, mid, fine] px (default: scaled to the figure's size on screen).
+    extra_strokes: more line-art strokes in screen px drawn after the figure (props, details).
+    line_style: "colored" (default) - each contour is a darker shade of the colour it outlines, so
+    the figure doesn't read as a cut-out with a black border; "ink" - every line in line_color.
+    depth_lines: lines get heavier on nearer parts and thinner/tinted toward haze_color on farther
+    parts (a strong depth cue). The figure also writes its depth into the document's depth buffer,
+    which atmosphere / depth_of_field / ambient_occlusion / scene_light / figure_shadow use.
+    Returns joints (screen px) and bone frames, so props can be placed in hands etc.""" + _POSE_DOC
+    cam = _camera(camera)
+    sizes = tuple(line_sizes) if line_sizes else None      # default: scaled to the figure's size
+    strokes, info, J, _ = fig.figure_strokes(pose, cam, colors=colors, sizes=sizes, attachments=attachments or [])
+    # depth: every part writes its distance into the document's depth buffer
+    buf = _depth_buffer(document)
+    ref = cam.depth(J["pelvis"])
+    for st in strokes:
+        z = st.pop("_z", ref)
+        if st.get("outline"):
+            buf.write_polygon2d(realism.outline_points(st["outline"]), z)
+        base_line = line_color
+        if line_style == "colored" and st.get("fill"):   # a darker shade of the colour it outlines
+            base_line = _mix_hex(st["fill"], "#000000", 0.62)
+        if depth_lines:      # nearer parts: heavier lines; farther: thinner, tinted toward the air
+            k_ = max(0.6, min(1.7, (ref / max(z, 1e-3)) ** 1.5))
+            st["size"] = float(st.get("size") or 3.0) * k_
+            t = (1 - math.exp(-max(z - ref, 0) * 0.35)) * 0.6
+            st["color"] = _mix_hex(base_line, haze_color, t)
+        elif base_line != line_color:
+            st["color"] = base_line
+    # props (extra strokes) sit at the depth of the hands unless they say otherwise ("depth": metres)
+    hand_z = (cam.depth(J["hand_l"]) + cam.depth(J["hand_r"])) / 2
+    for st in extra_strokes or []:
+        z = float(st.pop("depth", hand_z))
+        if st.get("outline"):
+            buf.write_polygon2d(realism.outline_points(st["outline"]), z)
+    draw_strokes(strokes + list(extra_strokes or []), engine="ink", layer=layer, new_layer=new_layer,
+                 color=line_color, natural=natural, seed=seed, document=document)
+    info["layer"] = new_layer or layer
+    return info
+
+
+# ----------------------------------------------------------------------------- depth
+
+_DEPTH = {}
+
+
+def _mix_hex(a, b, t):
+    ca, cb = realism.rgb(a), realism.rgb(b)
+    c = ca * (1 - t) + cb * t
+    return "#" + "".join(f"{int(round(v * 255)):02x}" for v in c)
+
+
+def _doc_size(document):
+    st = call("status", document=document)
+    d = st.get("active_document") or {}
+    return d.get("name", document or ""), int(d.get("width", 0)), int(d.get("height", 0))
+
+
+def _depth_buffer(document=None, reset=False):
+    name, w, h = _doc_size(document)
+    key = document or name
+    buf = _DEPTH.get(key)
+    if reset or buf is None or buf.w != w or buf.h != h:
+        buf = dpt.DepthBuffer(w, h)
+        _DEPTH[key] = buf
+    return buf
+
+
+@mcp.tool()
+def add_depth(polygons: list[list[list[float]]] | None = None, camera: dict | None = None,
+              layer: str | None = None, layer_depth: float | None = None, reset: bool = False,
+              document: str | None = None) -> dict:
+    """Write distances into the document's depth buffer (what makes atmosphere, depth of field,
+    ambient occlusion, scene lights and shadows work). Nearer surfaces win.
+    polygons: 3D polygons [[x, y, z], ...] in metres (the same coordinates and camera you projected
+      the scene with - walls, floor, ceiling, props); each is triangulated with perspective-correct depth.
+    layer + layer_depth: everything painted on that layer at one distance (m) - for flat elements
+      like a backdrop. draw_figure writes its own depth automatically. reset: clear first."""
+    buf = _depth_buffer(document, reset=reset)
+    n = 0
+    if polygons:
+        cam = _camera(camera)
+        for poly in polygons:
+            buf.write_polygon3d(cam, poly)
+            n += 1
+    if layer and layer_depth is not None:
+        img = _get(layer, document)
+        buf.write_mask(img[..., 3] > 0.3, float(layer_depth))
+    covered = float((buf.z < dpt.INF).mean())
+    return {"polygons": n, "covered": round(covered, 3)}
+
+
+@mcp.tool()
+def show_depth(max_size: int = 800, document: str | None = None) -> Image:
+    """See the depth buffer (near = white, far = dark, empty = red) to check it before using it."""
+    buf = _depth_buffer(document)
+    z = buf.z
+    finite = z < dpt.INF
+    out = np.zeros(z.shape + (3,), np.float32)
+    if finite.any():
+        lz = np.log(np.maximum(z, 1e-3))
+        lo, hi = lz[finite].min(), lz[finite].max()
+        g = 1 - (lz - lo) / max(hi - lo, 1e-6)
+        out[..., 0] = out[..., 1] = out[..., 2] = np.where(finite, g, 0)
+    out[~finite] = [0.6, 0.1, 0.1]
+    from PIL import Image as PILImage
+    im = PILImage.fromarray((np.clip(out, 0, 1) * 255).astype(np.uint8), "RGB")
+    im.thumbnail((max_size, max_size))
+    import io as _io
+    b = _io.BytesIO()
+    im.save(b, "PNG")
+    return Image(data=b.getvalue(), format="png")
+
+
+def _top_layer(document):
+    return call("list_layers", document=document)["layers"][0]["name"]
+
+
+@mcp.tool()
+def atmosphere(color: str = "#7fb6c8", density: float = 0.06, start: float = 0.0, max_opacity: float = 0.85,
+               mode: str = "normal", new_layer: str = "Atmosphere", above: str | None = None,
+               document: str | None = None) -> dict:
+    """Aerial perspective from the depth buffer: things fade toward `color` with distance
+    (opacity 1 - exp(-density * (distance - start)), capped). The strongest single cue that a scene
+    has depth. Goes on a new layer (top, or right above `above`)."""
+    buf = _depth_buffer(document)
+    out = dpt.atmosphere(buf.filled(), color, density, start, max_opacity)
+    r = _put(out, 0, 0, new_layer=new_layer, above=above or _top_layer(document), use_selection=False,
+             document=document)
+    if mode != "normal":
+        call("set_layer", layer=new_layer, blend_mode=mode, document=document)
+    return r
+
+
+@mcp.tool()
+def depth_of_field(focus: float | None = None, focus_point: list[float] | None = None, focus_range: float = 0.4,
+                   max_blur: float = 10.0, new_layer: str = "Depth of field", document: str | None = None) -> dict:
+    """Camera focus from the depth buffer: everything is blurred by how far it is from the focus
+    distance (metres) - or focus_point [x, y] to focus on whatever is at that pixel. Bakes the
+    visible image into a new top layer (hide it to edit underneath, then run it again)."""
+    buf = _depth_buffer(document)
+    z = buf.filled()
+    if focus is None:
+        if focus_point:
+            focus = float(z[int(focus_point[1]), int(focus_point[0])])
+        else:
+            focus = float(np.median(z[buf.z < dpt.INF])) if (buf.z < dpt.INF).any() else 5.0
+    img = _get(None, document)
+    out = dpt.depth_of_field(img, z, focus, focus_range, max_blur)
+    r = _put(out, 0, 0, new_layer=new_layer, above=_top_layer(document), use_selection=False, document=document)
+    r["focus"] = round(focus, 3)
+    return r
+
+
+@mcp.tool()
+def ambient_occlusion(radius: float = 14, strength: float = 0.8, color: str = "#05070a",
+                      new_layer: str = "Ambient occlusion", above: str | None = None,
+                      document: str | None = None) -> dict:
+    """Contact darkness from the depth buffer: creases, and where a figure or object comes close to
+    the floor or a wall behind it, get darker - ties objects into the scene. Multiply layer."""
+    buf = _depth_buffer(document)
+    occ = dpt.ambient_occlusion(buf.filled(), radius, strength)
+    out = realism.colorize(np.zeros(occ.shape, np.float32), color, color, alpha=occ)
+    r = _put(out, 0, 0, new_layer=new_layer, above=above or _top_layer(document), use_selection=False,
+             document=document)
+    call("set_layer", layer=new_layer, blend_mode="multiply", document=document)
+    return r
+
+
+@mcp.tool()
+def scene_light(layer: str, lights: list[dict], camera: dict | None = None, profile_radius: float = 10,
+                opacity: float = 1.0, new_layer: str | None = None, document: str | None = None) -> dict:
+    """Light a layer with point lights placed IN THE 3D SCENE (the lamps of the environment), using
+    the depth buffer for each pixel's position and the layer's shapes for surface direction:
+    surfaces facing a lamp and near it get its light, with distance falloff. Use the same lights
+    that light the environment, so figure and scene share one lighting.
+    lights: [{"pos": [x, y, z] metres, "color", "intensity" (1), "range" (m, falloff distance)}]
+    Result: an add layer just above `layer`."""
+    cam = _camera(camera)
+    buf = _depth_buffer(document)
+    img = _get(layer, document)
+    lm = dpt.point_lights(img, buf.filled(), cam, lights, profile_radius=profile_radius)
+    a = np.clip(lm.max(-1), 0, 1)
+    out = np.zeros(img.shape, np.float32)
+    out[..., :3] = np.clip(lm / np.maximum(a[..., None], 1e-6), 0, 1)
+    out[..., 3] = a
+    bb = _bbox(a, 1)
+    if bb is None:
+        return {"error": "No light reached the layer (check light positions and the depth buffer)."}
+    x0, y0, x1, y1 = bb
+    name = new_layer or f"{layer} scene light"
+    r = _put(out[y0:y1, x0:x1], x0, y0, new_layer=name, above=layer, opacity=opacity, use_selection=False,
+             document=document)
+    call("set_layer", layer=name, blend_mode="add", document=document)
+    return r
+
+
+@mcp.tool()
+def figure_shadow(pose: dict, light: list[float], camera: dict | None = None, floor_y: float = 0.0,
+                  color: str = "#06080c", opacity: float = 0.75, softness: float = 1.0,
+                  new_layer: str = "Figure shadow", above: str | None = None, document: str | None = None) -> dict:
+    """A real cast shadow on the floor from a posed figure (the same pose as draw_figure) and a
+    point light at `light` [x, y, z] metres - shape, direction and length come from the 3D geometry -
+    plus tight contact shadows wherever the body nearly touches the floor (feet, a knee down).
+    Put it above the floor/environment layer (`above`)."""
+    cam = _camera(camera)
+    name, w, h = _doc_size(document)
+    m = dpt.floor_shadow(fig.figure_spheres(pose), light, cam, w, h, floor_y, softness)
+    out = realism.colorize(np.zeros(m.shape, np.float32), color, color, alpha=np.clip(m, 0, 1))
+    bb = _bbox(m, 2)
+    if bb is None:
+        return {"error": "The shadow falls outside the picture."}
+    x0, y0, x1, y1 = bb
+    r = _put(out[y0:y1, x0:x1], x0, y0, new_layer=new_layer, above=above or _top_layer(document),
+             opacity=opacity, use_selection=False, document=document)
+    call("set_layer", layer=new_layer, blend_mode="multiply", document=document)
+    return r
+
+@mcp.tool()
+def integrate_subject(subject: str, light_wrap: float = 0.6, wrap_radius: float = 10, harmonize: float = 0.3,
+                      document: str | None = None) -> dict:
+    """Make a figure or object belong to the scene instead of sitting on top of it:
+      light_wrap - the background behind it bleeds softly over its edges (bright areas more), the way
+                   light and paint blend real subjects into their surroundings;
+      harmonize  - its colours are pulled toward the surrounding scene's palette and contrast.
+    subject: the layer or group holding the figure. Adds layers right above it."""
+    img = _get(subject, document)
+    call("set_layer", layer=subject, visible=False, document=document)
+    try:
+        bg = _get(None, document)
+    finally:
+        call("set_layer", layer=subject, visible=True, document=document)
+    bb = _bbox(img[..., 3], int(wrap_radius * 3))
+    if bb is None:
+        return {"error": f"{subject!r} is empty."}
+    x0, y0, x1, y1 = bb
+    sub, back = img[y0:y1, x0:x1], bg[y0:y1, x0:x1]
+    done = {}
+    if harmonize > 0:
+        h = dpt.harmonize(sub, back, harmonize)
+        _put(h, x0, y0, new_layer=f"{subject} harmonize", above=subject, use_selection=False, document=document)
+        done["harmonize"] = f"{subject} harmonize"
+    if light_wrap > 0:
+        w = dpt.light_wrap(sub, back, wrap_radius, light_wrap)
+        above = done.get("harmonize", subject)
+        _put(w, x0, y0, new_layer=f"{subject} light wrap", above=above, use_selection=False, document=document)
+        call("set_layer", layer=f"{subject} light wrap", blend_mode="screen", document=document)
+        done["light_wrap"] = f"{subject} light wrap"
+    return done
+
 # ----------------------------------------------------------------------------- guidance
 
 ART_GUIDE = r"""
@@ -1019,6 +1323,20 @@ HOW TO MAKE A STRONG PICTURE WITH THESE TOOLS
 10. Perspective: compute it. Put a tiny pinhole projection in your plan (camera height, tilt,
    focal length) and project 3D points for architecture and figures - low angle = camera low,
    tilted up, long-ish lens so the figure is heroic rather than distorted.
+
+10b. FIGURES: don't hand-place body parts. sketch_pose to find the pose (a few numbers: stance,
+   twist, lean, head, where the hands and feet go), then draw_figure with armor/clothing as bone
+   attachments (they follow any pose) and props placed from the returned hand positions.
+
+10c. DEPTH - so things sit IN the scene instead of on top of it:
+   - build the scene in 3D coordinates with one camera; add_depth(polygons) for the environment,
+     draw_figure writes its own depth;
+   - scene_light with the environment's actual lamps (same positions) on every figure layer;
+   - figure_shadow from the main lamp + ambient_occlusion above the environment layer;
+   - integrate_subject on each figure (light wrap + palette harmonizing);
+   - draw_figure line_style="colored" (or no lines at all) when the environment has no ink lines -
+     a black outline on a figure in an unlined scene reads as a sticker;
+   - atmosphere (haze by distance), then depth_of_field focused on the subject, last.
 
 11. Iterate. look after every few steps. undo takes back a whole call. Save .kra (keeps layers) and
    export_image the PNG.

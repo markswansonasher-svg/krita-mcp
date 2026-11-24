@@ -43,6 +43,34 @@ Line-art drawing is built into `draw_strokes`, so it works on the first try:
 
 The heavy image work (numpy, SciPy, Pillow) runs in the MCP server, so the Krita plugin stays lightweight. `uv` installs these the first time the server starts.
 
+## Posed figures (v0.4)
+
+`draw_figure` draws a human figure from a **pose**: a few numbers for stance, twist, lean and head turn, plus where the hands and feet go. Elbows and knees are solved automatically (two-bone IK). Arms and legs are single anatomical contours through the joints (calf bulge, forearm swell, thigh tapering to the knee). Armor, clothing and gear are attached to bones, so they follow any pose. `sketch_pose` draws a quick stick skeleton to check a pose first.
+
+![Three poses drawn from pose numbers](docs/poses.png)
+
+The soldier, posed and armored through bone attachments, with the rifle placed by his hands:
+
+![Posed soldier](docs/scifi-soldier-posed.png)
+
+## Depth: making things part of the scene (v0.4)
+
+Every document has a **depth buffer**. `add_depth` writes the environment's 3D polygons into it, and `draw_figure` writes the figure's depth automatically. These tools use it:
+
+- **`atmosphere`**: haze by real distance.
+- **`depth_of_field`**: focus and blur by distance.
+- **`ambient_occlusion`**: contact darkness where things meet.
+- **`scene_light`**: the environment's own 3D lamps light each figure by position, with falloff.
+- **`figure_shadow`**: a cast shadow computed from the 3D pose and a lamp, plus contact shadows.
+- **`integrate_subject`**: background light wraps over a figure's edges, and its colors shift toward the scene's palette.
+- **`show_depth`**: look at the depth buffer to check it.
+
+`draw_figure` also scales line weight by distance and, by default, draws each contour in a darker shade of the color it outlines instead of black.
+
+Two simple characters at different depths in the same hallway, lit by the same lamps, from one run of [`examples/depth_demo.py`](examples/depth_demo.py):
+
+![Two figures at different depths](docs/depth-demo.png)
+
 ## Where this stands next to image generators
 
 Diffusion models (the image generators in ChatGPT, Gemini and others) are still far ahead at photorealism, painterly texture and natural anatomy. This MCP is good at different things:
@@ -118,6 +146,8 @@ Optional environment variables:
 | Rendering | `paint` (antialiased shapes with flat colors or linear, radial or conical gradients, per-shape erase), `paint_svg` (SVG with gradients straight onto a layer), `add_svg` (editable vector layer). All take `mode` (blend mode), `clip` (only where paint exists), `blur` (soft edges, glows) and `new_layer`. |
 | Procedural | `scatter_strokes` (grass, fur, scratches, sparks, dust), `hatch` (hatching and cross-hatching in any polygon) |
 | Selection & masks | `select` (rect, ellipse, circle, polygon, smooth path, shapes, SVG, a layer's paint, invert; add, subtract or intersect; feather, grow, shrink), `add_mask` (transparency mask) |
+| Figures | `sketch_pose`, `draw_figure` (pose, IK, anatomy, bone attachments, depth-aware lines) |
+| Depth | `add_depth`, `show_depth`, `atmosphere`, `depth_of_field`, `ambient_occlusion`, `scene_light`, `figure_shadow`, `integrate_subject` |
 | Realism | `fill_line_art` (color drawn line art between its lines), `edge_light` (rim light on light-facing edges), `render_form` (lit 3D forms from flat shapes, with materials), `texture`, `cast_shadow`, `painterly`; `tube` and `blob` shapes; `natural` and `passes` for strokes |
 | Other | `art_guide` (workflow advice for complex pictures), `list_filters`, `filter_settings`, `apply_filter`, `run_action`, `list_actions`, `undo` (a whole call), `redo`, `execute_python` |
 

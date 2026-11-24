@@ -626,6 +626,34 @@ def _catmull(pts, per=8):
     return out
 
 
+def _seg_intersect(p1, p2, p3, p4):
+    d = (p2[0] - p1[0]) * (p4[1] - p3[1]) - (p2[1] - p1[1]) * (p4[0] - p3[0])
+    if abs(d) < 1e-9:
+        return None
+    t = ((p3[0] - p1[0]) * (p4[1] - p3[1]) - (p3[1] - p1[1]) * (p4[0] - p3[0])) / d
+    u = ((p3[0] - p1[0]) * (p2[1] - p1[1]) - (p3[1] - p1[1]) * (p2[0] - p1[0])) / d
+    if 0 < t < 1 and 0 < u < 1:
+        return [p1[0] + t * (p2[0] - p1[0]), p1[1] + t * (p2[1] - p1[1])]
+    return None
+
+
+def remove_loops(pts, window=40):
+    """Cut the little self-crossing loops an offset curve makes on the inside of a sharp bend."""
+    out = list(pts)
+    i = 0
+    while i < len(out) - 3:
+        cut = False
+        for j in range(min(len(out) - 2, i + window), i + 1, -1):
+            x = _seg_intersect(out[i], out[i + 1], out[j], out[j + 1])
+            if x is not None:
+                out = out[:i + 1] + [x] + out[j + 1:]
+                cut = True
+                break
+        if not cut:
+            i += 1
+    return out
+
+
 def tube_outline(spine, caps=True):
     """spine [[x, y, radius], ...] -> closed outline points of a smooth tube (limbs, fingers, tentacles,
     branches, hair locks, horns). Radius can change along the spine."""
@@ -640,6 +668,7 @@ def tube_outline(spine, caps=True):
         nx, ny = -dy / ln, dx / ln
         left.append([x + nx * r, y + ny * r])
         right.append([x - nx * r, y - ny * r])
+    left, right = remove_loops(left), remove_loops(right)
     out = left
     if caps:
         x, y, r = pts[-1]
